@@ -22,6 +22,7 @@ Open the printed URL on your phone (same Wi-Fi network).
 
 - Real-time terminal output with syntax coloring
 - Tab management (create, close, rename via long-press)
+- Split-pane switcher — view and control any pane in a split tab
 - Multi-window support with spatial map
 - Broadcast commands to multiple windows
 - Command history with arrow navigation
@@ -39,17 +40,25 @@ Open the printed URL on your phone (same Wi-Fi network).
 ## Requirements
 
 - macOS with iTerm2
-- Node.js >= 18
+- iTerm2 **Python API enabled**: Settings → General → Magic → "Enable Python API"
+- Python 3.8+ (Homebrew `python3` recommended; the launcher creates its own venv)
+- Node.js >= 18 (serves the web UI)
 - Phone on the same Wi-Fi
+
+On first launch, iTerm2 asks macOS for a one-time Automation permission so the
+server can connect to it — approve it once and it won't ask again.
 
 ## Manual Setup
 
 ```bash
 git clone https://github.com/mammadovziya/remote-iterm.git
 cd remote-iterm
-cd server && npm install && cd ../client && npm install
+cd client && npm install && cd ..
 ./iterm-server
 ```
+
+The first `./iterm-server` run creates a Python virtualenv under `server/.venv`
+and installs the server's dependencies automatically.
 
 ## Ports
 

@@ -6,7 +6,7 @@
     "remote-iterm": "iterm-server"
   },
   "scripts": {
-    "postinstall": "cd server && npm install && cd ../client && npm install",
+    "postinstall": "cd client && npm install",
     "start": "./iterm-server start",
     "stop": "./iterm-server stop",
     "restart": "./iterm-server restart"
@@ -37,7 +37,7 @@
     "iterm-server",
     "server/",
     "client/",
-    "!server/node_modules",
+    "!server/.venv",
     "!client/node_modules",
     "!client/dist",
     "README.md"

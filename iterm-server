@@ -1,5 +1,5 @@
 #!/bin/bash
-# Remote iTerm — server (7291) + client dev (7292)
+# Remote iTerm — Python server (7291) + client dev (7292)
 
 SOURCE="$0"
 while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
@@ -12,63 +12,122 @@ fi
 
 PIDFILE="$DIR/.iterm-server.pid"
 LOGFILE="$DIR/.iterm-server.log"
+VENV="$DIR/server/.venv"
+REQ="$DIR/server/requirements.txt"
+STAMP="$VENV/.requirements.sha"
 
 get_local_ip() {
   ipconfig getifaddr en0 2>/dev/null || echo "localhost"
 }
 
+# Locate a usable python3 (>=3.8). Verifies it actually runs so we don't pick
+# the /usr/bin/python3 Command Line Tools shim that only pops an install dialog.
+find_python() {
+  local cand
+  for cand in /opt/homebrew/bin/python3 /usr/local/bin/python3 "$(command -v python3 2>/dev/null)"; do
+    if [ -n "$cand" ] && [ -x "$cand" ] && \
+       "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3,8) else 1)' >/dev/null 2>&1; then
+      echo "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Create the venv once and (re)install deps only when requirements change.
+ensure_venv() {
+  local py want
+  if [ ! -x "$VENV/bin/python" ]; then
+    py="$(find_python)" || {
+      echo "  No usable python3 (>=3.8) found. Install one, e.g. 'brew install python3'." >&2
+      return 1
+    }
+    echo "  Setting up Python environment…"
+    "$py" -m venv "$VENV" || return 1
+    "$VENV/bin/python" -m pip install --quiet --upgrade pip
+  fi
+
+  want="$(shasum -a 256 "$REQ" | awk '{print $1}')"
+  if [ ! -f "$STAMP" ] || [ "$(cat "$STAMP" 2>/dev/null)" != "$want" ]; then
+    echo "  Installing Python dependencies…"
+    "$VENV/bin/pip" install --quiet -r "$REQ" || return 1
+    echo "$want" > "$STAMP"
+  fi
+  return 0
+}
+
 do_start() {
-  if [ -f "$PIDFILE" ] && kill -0 $(head -1 "$PIDFILE" 2>/dev/null) 2>/dev/null; then
+  if lsof -nP -tiTCP:7291 -sTCP:LISTEN >/dev/null 2>&1; then
     echo "  Already running"
     return 1
   fi
 
-  cd "$DIR/server" && node index.js >> "$LOGFILE" 2>&1 &
+  ensure_venv || return 1
+
+  # exec in the subshell so $! is the real daemon pid (not the subshell wrapper),
+  # which keeps the pidfile accurate for `stop`.
+  ( cd "$DIR/server" && exec "$VENV/bin/python" -u server.py >> "$LOGFILE" 2>&1 ) &
   SERVER_PID=$!
 
-  cd "$DIR/client" && npx vite --host --port 7292 >> "$LOGFILE" 2>&1 &
+  ( cd "$DIR/client" && exec npx vite --host --port 7292 >> "$LOGFILE" 2>&1 ) &
   CLIENT_PID=$!
 
   echo "$SERVER_PID $CLIENT_PID" > "$PIDFILE"
 
   IP=$(get_local_ip)
   URL="http://${IP}:7292"
-  node -e "
-    require('$DIR/server/node_modules/qrcode-terminal').generate('$URL', {small: true}, function(qr) {
-      var lines = qr.split('\n').filter(Boolean);
-      var info = [
-        '',
-        '  Remote iTerm',
-        '',
-        '  Local:    http://localhost:7292',
-        '  Network:  $URL',
-        '',
-        '  Scan QR from your phone',
-      ];
-      var max = Math.max(lines.length, info.length);
-      var out = '';
-      for (var i = 0; i < max; i++) {
-        var q = (lines[i] || '').padEnd(30);
-        var t = info[i] || '';
-        out += '  ' + q + t + '\n';
-      }
-      console.log('\n' + out);
-    });
-  " 2>/dev/null
+  "$VENV/bin/python" - "$URL" <<'PYQR'
+import sys
+
+url = sys.argv[1]
+print()
+try:
+    import qrcode
+    qr = qrcode.QRCode(border=1)
+    qr.add_data(url)
+    qr.make(fit=True)
+    qr.print_ascii(invert=True)
+except Exception:
+    pass
+print()
+print("  Remote iTerm")
+print()
+print("  Local:    http://localhost:7292")
+print(f"  Network:  {url}")
+print()
+print("  Scan the QR from your phone (same Wi-Fi)")
+print()
+PYQR
 }
 
 do_stop() {
-  if [ ! -f "$PIDFILE" ]; then
-    echo "  Not running"
-    return 1
-  fi
-  read -r PIDS < "$PIDFILE"
-  kill $PIDS 2>/dev/null
-  for pid in $PIDS; do
-    pkill -P "$pid" 2>/dev/null
+  killed=0
+
+  # Primary: kill whatever actually holds our ports, plus their children. This
+  # works even if the pidfile is stale or processes were reparented.
+  for port in 7291 7292; do
+    for pid in $(lsof -nP -tiTCP:$port -sTCP:LISTEN 2>/dev/null); do
+      pkill -P "$pid" 2>/dev/null
+      kill "$pid" 2>/dev/null && killed=1
+    done
   done
-  rm -f "$PIDFILE"
-  echo "  Stopped"
+
+  # Also honor the pidfile (and reap its children) in case a process is mid-start
+  # and not yet listening.
+  if [ -f "$PIDFILE" ]; then
+    read -r PIDS < "$PIDFILE"
+    for pid in $PIDS; do
+      pkill -P "$pid" 2>/dev/null
+      kill "$pid" 2>/dev/null && killed=1
+    done
+    rm -f "$PIDFILE"
+  fi
+
+  if [ "$killed" = "1" ]; then
+    echo "  Stopped"
+  else
+    echo "  Not running"
+  fi
 }
 
 case "${1:-start}" in

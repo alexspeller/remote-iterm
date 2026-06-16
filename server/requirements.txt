@@ -1,0 +1,9 @@
+iterm2
+python-socketio
+aiohttp
+pyobjc-framework-Cocoa
+qrcode
+# iterm2 imports the deprecated websockets.legacy.client API. Cap the major to
+# avoid a future websockets release removing it and breaking fresh installs.
+# (Verified working with websockets 16.x.)
+websockets<17

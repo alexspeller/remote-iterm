@@ -1,19 +1,19 @@
-import { useState, useEffect, useRef, useMemo } from 'react';
+import { useState, useEffect, useRef, useMemo, memo } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { Plus, X, Send, Clock, ChevronUp, ChevronDown, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2 } from 'lucide-react';
+import { Plus, X, Send, Clock, ChevronUp, ChevronDown, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, LayoutGrid } from 'lucide-react';
 
 // --- Types ---
-interface Session { id: string; name: string; }
-interface Tab { index: number; id: string; isSelected: boolean; sessions: Session[]; }
+interface PaneRect { x: number; y: number; w: number; h: number; }
+interface Session { id: string; name: string; rect?: PaneRect; }
+interface Tab { index: number; id: string; title?: string; isSelected: boolean; currentSessionId?: string; aspect?: number; maximized?: boolean; sessions: Session[]; }
 interface Bounds { x: number; y: number; w: number; h: number; }
 interface WindowState { id: string; isFront: boolean; tabs: Tab[]; bounds?: Bounds; }
 interface ScreenSize { width: number; height: number; }
 
-interface ColoredLine {
-  text: string;
-  color: string;
-  bold: boolean;
-}
+// A run of text sharing one style: t=text, f=fg hex, g=bg hex, b=bold.
+// f/g omitted means "use the pane default" (theme fg/bg).
+interface Run { t: string; f?: string; g?: string; b?: boolean }
+interface StyledContent { lines: Run[][]; fg: string; bg: string }
 
 const ACCENT = '#10b981';
 const BROADCAST_COLOR = '#818cf8';
@@ -35,97 +35,20 @@ function saveHistory(h: string[]) {
 function getSelectedTab(win?: WindowState): Tab | undefined {
   return win?.tabs.find(t => t.isSelected) || win?.tabs[0];
 }
-
-// --- Precompiled regex patterns for line colorizer ---
-const RE_PROMPT_1 = /^.*[@:].*[\$%#>]\s/;
-const RE_PROMPT_2 = /^[\$%#>]\s/;
-const RE_PROMPT_3 = /^\(.*\)\s*[\$%#>]\s/;
-const RE_ERROR = /\b(error|ERR!?|FAIL(ED)?|fatal|FATAL|panic|denied|not found|No such file|ENOENT|EACCES|exception|crash)\b/i;
-const RE_WARN = /\b(warn(ing)?|WARN(ING)?|deprecated|DEPRECATED|caution)\b/i;
-const RE_SUCCESS = /\b(success|SUCCESS|✓|passed|PASSED|done|DONE|compiled|built|complete[d]?|installed|ok\b|OK\b)/i;
-const RE_PATH = /^(\/|~\/|\.\/|\.\.\/)/;
-const RE_TREE = /^\s*(├|└|│|─)/;
-const RE_DIFF_ADD = /^\+[^+]/;
-const RE_DIFF_DEL = /^-[^-]/;
-const RE_COMMENT = /^\s*#(?!\!)/;
-
-// --- Terminal line colorizer ---
-function colorizeLines(content: string): ColoredLine[] {
-  const lines = content.split('\n');
-  const result: ColoredLine[] = [];
-  const lastIdx = lines.length - 1;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const trimmed = line.trimStart();
-
-    // Current prompt (last non-empty line) — bright white
-    if (i === lastIdx && trimmed) {
-      result.push({ text: line, color: '#f5f5f5', bold: true });
-      continue;
-    }
-
-    // Prompt lines: user@host, ends with $ or %, starts with $ % # >
-    if (RE_PROMPT_1.test(trimmed) || RE_PROMPT_2.test(trimmed) || RE_PROMPT_3.test(trimmed)) {
-      result.push({ text: line, color: '#22d3ee', bold: true }); // cyan
-      continue;
-    }
-
-    // Error / failure lines
-    if (RE_ERROR.test(line)) {
-      result.push({ text: line, color: '#f87171', bold: false }); // red
-      continue;
-    }
-
-    // Warning lines
-    if (RE_WARN.test(line)) {
-      result.push({ text: line, color: '#fbbf24', bold: false }); // amber
-      continue;
-    }
-
-    // Success / positive lines
-    if (RE_SUCCESS.test(line)) {
-      result.push({ text: line, color: '#34d399', bold: false }); // green
-      continue;
-    }
-
-    // File paths
-    if (RE_PATH.test(trimmed) || RE_TREE.test(line)) {
-      result.push({ text: line, color: '#818cf8', bold: false }); // indigo
-      continue;
-    }
-
-    // Git diff + / -
-    if (RE_DIFF_ADD.test(trimmed)) {
-      result.push({ text: line, color: '#4ade80', bold: false });
-      continue;
-    }
-    if (RE_DIFF_DEL.test(trimmed)) {
-      result.push({ text: line, color: '#fb7185', bold: false });
-      continue;
-    }
-
-    // Comments
-    if (RE_COMMENT.test(line)) {
-      result.push({ text: line, color: '#52525b', bold: false });
-      continue;
-    }
-
-    // Default — light gray
-    result.push({ text: line, color: '#d4d4d8', bold: false });
-  }
-
-  return result;
+// The pane to show when a tab is selected: the one iTerm has focused, else the first.
+function tabDefaultSession(tab?: Tab): string | undefined {
+  return tab?.currentSessionId || tab?.sessions[0]?.id;
 }
 
 export default function App() {
   const [connected, setConnected] = useState(false);
   const [state, setState] = useState<WindowState[]>([]);
   const [screenSize, setScreenSize] = useState<ScreenSize | null>(null);
-  const [content, setContent] = useState<string>('');
+  const [content, setContent] = useState<StyledContent | null>(null);
   const [command, setCommand] = useState('');
   const [selectedWinId, setSelectedWinId] = useState<string | null>(null);
   const [selectedTabId, setSelectedTabId] = useState<string | null>(null);
+  const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [showMap, setShowMap] = useState(false);
   const [keyboardMode, setKeyboardMode] = useState(false);
   const [scrollLocked, setScrollLocked] = useState(false);
@@ -136,12 +59,16 @@ export default function App() {
   const [isLandscape, setIsLandscape] = useState(window.matchMedia('(orientation: landscape)').matches);
   const [splitMode, setSplitMode] = useState(false);
   const [splitSessionId, setSplitSessionId] = useState<string | null>(null);
-  const [splitContent, setSplitContent] = useState<string>('');
+  const [splitContent, setSplitContent] = useState<StyledContent | null>(null);
   const [splitRatio, setSplitRatio] = useState(0.5);
   const [focusedPane, setFocusedPane] = useState<'primary' | 'split'>('primary');
   const [splitWinId, setSplitWinId] = useState<string | null>(null);
   const [splitTabId, setSplitTabId] = useState<string | null>(null);
   const [showSplitMap, setShowSplitMap] = useState(false);
+  const [showPaneMap, setShowPaneMap] = useState(false);
+  // Bumped to re-render the pane map's content thumbnails when cached pane
+  // content arrives (cache lives in a ref, so it can't trigger renders itself).
+  const [, setPreviewTick] = useState(0);
   const socketRef = useRef<Socket | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const splitContentRef = useRef<HTMLDivElement>(null);
@@ -149,6 +76,7 @@ export default function App() {
   const stateRef = useRef(state);
   const winIdRef = useRef(selectedWinId);
   const tabIdRef = useRef(selectedTabId);
+  const selectedSessionIdRef = useRef(selectedSessionId);
   const prevFrontRef = useRef<string | null>(null);
   const historyRef = useRef<string[]>(loadHistory());
   const historyIdxRef = useRef(-1);
@@ -156,24 +84,23 @@ export default function App() {
   const lastContentTimeRef = useRef(0);
   const contentChangingRef = useRef(false);
   const alertTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const contentCacheRef = useRef<Map<string, string>>(new Map());
+  const contentCacheRef = useRef<Map<string, StyledContent>>(new Map());
   const lastBgFetchRef = useRef(0);
   const splitSessionIdRef = useRef(splitSessionId);
   const focusedPaneRef = useRef(focusedPane);
   const splitWinIdRef = useRef(splitWinId);
   const splitTabIdRef = useRef(splitTabId);
+  const paneMapOpenRef = useRef(false);
 
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => { winIdRef.current = selectedWinId; }, [selectedWinId]);
   useEffect(() => { tabIdRef.current = selectedTabId; }, [selectedTabId]);
+  useEffect(() => { selectedSessionIdRef.current = selectedSessionId; }, [selectedSessionId]);
   useEffect(() => { splitSessionIdRef.current = splitSessionId; }, [splitSessionId]);
   useEffect(() => { focusedPaneRef.current = focusedPane; }, [focusedPane]);
   useEffect(() => { splitWinIdRef.current = splitWinId; }, [splitWinId]);
   useEffect(() => { splitTabIdRef.current = splitTabId; }, [splitTabId]);
-
-  // Colorized terminal lines (memoized)
-  const coloredLines = useMemo(() => colorizeLines(content), [content]);
-  const splitColoredLines = useMemo(() => colorizeLines(splitContent), [splitContent]);
+  useEffect(() => { paneMapOpenRef.current = showPaneMap; }, [showPaneMap]);
 
   // --- Socket init ---
   useEffect(() => {
@@ -213,7 +140,7 @@ export default function App() {
         const win = frontWin || newState[0];
         setSelectedWinId(win.id);
         const tab = getSelectedTab(win);
-        if (tab) setSelectedTabId(tab.id);
+        if (tab) { setSelectedTabId(tab.id); setSelectedSessionId(tabDefaultSession(tab) || null); }
         prevFrontRef.current = frontWin?.id || null;
       }
       // Front window changed on Mac — follow it
@@ -221,7 +148,7 @@ export default function App() {
         prevFrontRef.current = frontWin.id;
         setSelectedWinId(frontWin.id);
         const tab = getSelectedTab(frontWin);
-        if (tab) setSelectedTabId(tab.id);
+        if (tab) { setSelectedTabId(tab.id); setSelectedSessionId(tabDefaultSession(tab) || null); }
       }
       // Same window — sync tab if Mac switched it
       else {
@@ -230,19 +157,18 @@ export default function App() {
           const macTab = win.tabs.find(t => t.isSelected);
           if (macTab && macTab.id !== tabIdRef.current) {
             setSelectedTabId(macTab.id);
+            setSelectedSessionId(tabDefaultSession(macTab) || null);
           }
           if (!win.tabs.find(t => t.id === tabIdRef.current)) {
             const fb = getSelectedTab(win);
-            if (fb) setSelectedTabId(fb.id);
+            if (fb) { setSelectedTabId(fb.id); setSelectedSessionId(tabDefaultSession(fb) || null); }
           }
         }
       }
 
       // Refresh content for ALL background sessions across ALL windows (throttled to every 3s)
       if (Date.now() - lastBgFetchRef.current > 3000) {
-        const activeTab = (newState.find(w => w.id === winIdRef.current) || newState[0])
-          ?.tabs.find(t => t.id === tabIdRef.current);
-        const activeSid = activeTab?.sessions[0]?.id;
+        const activeSid = selectedSessionIdRef.current;
         const bgIds = newState
           .flatMap(w => w.tabs.map(t => t.sessions[0]?.id))
           .filter((sid): sid is string => !!sid && sid !== activeSid);
@@ -253,20 +179,22 @@ export default function App() {
       }
     });
 
-    s.on('content', (data: { sessionId?: string; content: string }) => {
+    s.on('content', (data: { sessionId?: string } & StyledContent) => {
+      const styled: StyledContent = { lines: data.lines, fg: data.fg, bg: data.bg };
       if (data.sessionId) {
-        contentCacheRef.current.set(data.sessionId, data.content);
+        contentCacheRef.current.set(data.sessionId, styled);
+        // Refresh the pane map's thumbnails while it's open (cached content for
+        // non-viewed panes doesn't otherwise trigger a render).
+        if (paneMapOpenRef.current) setPreviewTick(t => t + 1);
         // Update split pane if this is the split session
         if (data.sessionId === splitSessionIdRef.current) {
-          setSplitContent(data.content);
+          setSplitContent(styled);
         }
-        // Only update main content if this is for the active session
-        const activeWin = stateRef.current.find(w => w.id === winIdRef.current);
-        const activeTab = activeWin?.tabs.find(t => t.id === tabIdRef.current);
-        const activeSid = activeTab?.sessions[0]?.id;
-        if (data.sessionId !== activeSid) return;
+        // Only update main content if it's the pane we're viewing (which may be
+        // any pane in the selected tab, not just the first).
+        if (data.sessionId !== selectedSessionIdRef.current) return;
       }
-      setContent(data.content);
+      setContent(styled);
       // Track content changes for long-running command alerts
       lastContentTimeRef.current = Date.now();
       contentChangingRef.current = true;
@@ -298,6 +226,28 @@ export default function App() {
     return () => mq.removeEventListener('change', handler);
   }, []);
 
+  // Keep the viewed pane valid: if it vanishes (closed or unsplit on the Mac),
+  // fall back to the selected tab's default pane.
+  useEffect(() => {
+    const win = state.find(w => w.id === selectedWinId);
+    const tab = win?.tabs.find(t => t.id === selectedTabId);
+    if (!tab) return;
+    if (!selectedSessionId || !tab.sessions.some(sess => sess.id === selectedSessionId)) {
+      setSelectedSessionId(tabDefaultSession(tab) || null);
+    }
+  }, [state, selectedWinId, selectedTabId, selectedSessionId]);
+
+  // Tell the server which sessions we're viewing (main + split) so it streams
+  // exactly those, regardless of which pane iTerm has focused on the Mac.
+  useEffect(() => {
+    const s = socketRef.current;
+    if (!s || !connected) return;
+    const ids: string[] = [];
+    if (selectedSessionId) ids.push(selectedSessionId);
+    if (splitMode && splitSessionId) ids.push(splitSessionId);
+    s.emit('watch', { sessionIds: ids });
+  }, [connected, selectedSessionId, splitMode, splitSessionId]);
+
   // Auto-scroll terminal to bottom (unless scroll-locked)
   useEffect(() => {
     if (!scrollLocked && contentRef.current) {
@@ -328,6 +278,7 @@ export default function App() {
     if (focusedPaneRef.current === 'split' && splitSessionIdRef.current) {
       return splitSessionIdRef.current;
     }
+    if (selectedSessionIdRef.current) return selectedSessionIdRef.current;
     const win = stateRef.current.find(w => w.id === winIdRef.current);
     const tab = win?.tabs.find(t => t.id === tabIdRef.current);
     return tab?.sessions[0]?.id;
@@ -395,7 +346,7 @@ export default function App() {
     if (focusedPane === 'split') {
       setSplitWinId(winId);
       setSplitTabId(tab.id);
-      const sid = tab.sessions[0]?.id;
+      const sid = tabDefaultSession(tab);
       if (sid) {
         setSplitSessionId(sid);
         const cached = contentCacheRef.current.get(sid);
@@ -405,8 +356,9 @@ export default function App() {
     } else {
       setSelectedWinId(winId);
       setSelectedTabId(tab.id);
-      const sid = tab.sessions[0]?.id;
+      const sid = tabDefaultSession(tab);
       if (sid) {
+        setSelectedSessionId(sid);
         const cached = contentCacheRef.current.get(sid);
         if (cached) setContent(cached);
         socketRef.current?.emit('getContent', { sessionId: sid });
@@ -423,7 +375,7 @@ export default function App() {
       const tab = getSelectedTab(win);
       if (tab) {
         setSplitTabId(tab.id);
-        const sid = tab.sessions[0]?.id;
+        const sid = tabDefaultSession(tab);
         if (sid) {
           setSplitSessionId(sid);
           const cached = contentCacheRef.current.get(sid);
@@ -438,8 +390,9 @@ export default function App() {
       const tab = getSelectedTab(win);
       if (tab) {
         setSelectedTabId(tab.id);
-        const sid = tab.sessions[0]?.id;
+        const sid = tabDefaultSession(tab);
         if (sid) {
+          setSelectedSessionId(sid);
           const cached = contentCacheRef.current.get(sid);
           if (cached) setContent(cached);
           socketRef.current?.emit('getContent', { sessionId: sid });
@@ -459,10 +412,10 @@ export default function App() {
     const tab = getSelectedTab(win);
     if (tab) {
       setSplitTabId(tab.id);
-      const sid = tab.sessions[0]?.id;
+      const sid = tabDefaultSession(tab);
       if (sid) {
         setSplitSessionId(sid);
-        setSplitContent(contentCacheRef.current.get(sid) || '');
+        setSplitContent(contentCacheRef.current.get(sid) || null);
         socketRef.current?.emit('getContent', { sessionId: sid });
       }
     }
@@ -471,7 +424,7 @@ export default function App() {
 
   const handleSplitTabClick = (tab: Tab) => {
     setSplitTabId(tab.id);
-    const sid = tab.sessions[0]?.id;
+    const sid = tabDefaultSession(tab);
     if (sid) {
       setSplitSessionId(sid);
       const cached = contentCacheRef.current.get(sid);
@@ -479,6 +432,23 @@ export default function App() {
       socketRef.current?.emit('getContent', { sessionId: sid });
     }
     setFocusedPane('split');
+  };
+
+  // Open the spatial pane map and request a content snapshot for every pane so
+  // the thumbnails populate (panes we aren't actively viewing aren't streamed).
+  const handleOpenPaneMap = () => {
+    setShowPaneMap(true);
+    const ids = primaryPanes.map(p => p.id).filter(Boolean);
+    if (ids.length) socketRef.current?.emit('getAllContent', { sessionIds: ids });
+  };
+
+  // Switch which pane (split session) of the current tab fills the primary view.
+  const handlePaneSelect = (sessionId: string) => {
+    setSelectedSessionId(sessionId);
+    setFocusedPane('primary');
+    setShowPaneMap(false);
+    setContent(contentCacheRef.current.get(sessionId) || null);
+    socketRef.current?.emit('getContent', { sessionId });
   };
 
   const longPressRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -518,7 +488,8 @@ export default function App() {
 
   const handleCopy = async () => {
     try {
-      const text = focusedPane === 'split' ? splitContent : content;
+      const styled = focusedPane === 'split' ? splitContent : content;
+      const text = styled ? styled.lines.map(runs => runs.map(r => r.t).join('')).join('\n') : '';
       await navigator.clipboard.writeText(text);
     } catch {}
   };
@@ -529,6 +500,9 @@ export default function App() {
   const tabBarSelectedTabId = (splitMode && focusedPane === 'split') ? splitTabId : selectedTabId;
   const tabCount = tabBarWindow?.tabs.length || 0;
   const splitTabCount = splitWindow?.tabs.length || 0;
+  // Panes (split sessions) of the primary tab — drives the per-tab pane switcher.
+  const primaryTab = activeWindow?.tabs.find(t => t.id === selectedTabId);
+  const primaryPanes = primaryTab?.sessions || [];
 
   // All other sessions for split picker (exclude current active)
   const allSessions = useMemo(() => {
@@ -536,7 +510,7 @@ export default function App() {
     const activeSid = activeTab?.sessions[0]?.id;
     return state.flatMap(w => w.tabs.map(t => ({
       sessionId: t.sessions[0]?.id,
-      name: t.sessions[0]?.name || `Tab ${t.index}`,
+      name: t.title || t.sessions[0]?.name || `Tab ${t.index}`,
     }))).filter(s => s.sessionId && s.sessionId !== activeSid);
   }, [state, activeWindow, selectedTabId]);
 
@@ -627,7 +601,7 @@ export default function App() {
           {/* Split pane toggle */}
           <button
             onClick={() => {
-              if (splitMode) { setSplitMode(false); setSplitSessionId(null); setSplitContent(''); setFocusedPane('primary'); setSplitWinId(null); setSplitTabId(null); }
+              if (splitMode) { setSplitMode(false); setSplitSessionId(null); setSplitContent(null); setFocusedPane('primary'); setSplitWinId(null); setSplitTabId(null); }
               else if (allSessions.length > 0) {
                 // Find the first session that's not the primary active one
                 const firstOther = allSessions[0];
@@ -645,7 +619,7 @@ export default function App() {
                 setSplitSessionId(sid);
                 setSplitWinId(foundWin);
                 setSplitTabId(foundTab);
-                setSplitContent(contentCacheRef.current.get(sid) || '');
+                setSplitContent(contentCacheRef.current.get(sid) || null);
                 socketRef.current?.emit('getContent', { sessionId: sid });
               }
             }}
@@ -775,6 +749,76 @@ export default function App() {
         </div>
       )}
 
+      {/* ── Pane Layout Map (spatial pane switcher) ── */}
+      {showPaneMap && primaryPanes.length > 1 && (
+        <div
+          className="fixed inset-0 z-[60] flex flex-col items-center justify-center"
+          onClick={() => setShowPaneMap(false)}
+          style={{ backgroundColor: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)' }}
+        >
+          <div className="mb-4 px-6 text-center">
+            <div className="text-[11px] font-bold tracking-[0.2em] text-zinc-500">
+              SELECT PANE — {primaryTab?.title || `Tab ${primaryTab?.index}`}
+            </div>
+            {primaryTab?.maximized && (
+              <div className="text-[9px] text-amber-500/70 tracking-wider mt-1">
+                a pane is maximized in iTerm — shown as a grid
+              </div>
+            )}
+          </div>
+          <div
+            className="relative rounded-xl bg-zinc-800/20 border border-zinc-700/30 overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              // Preserve the tab's real aspect ratio while fitting both axes:
+              // width is capped so height (= width / aspect) never exceeds ~56vh.
+              aspectRatio: `${primaryTab?.aspect || 1.6}`,
+              width: `min(88vw, ${(56 * (primaryTab?.aspect || 1.6)).toFixed(1)}vh)`,
+            }}
+          >
+            {primaryPanes.map((pane, idx) => {
+              const r = pane.rect;
+              if (!r) return null;
+              const isSel = pane.id === selectedSessionId;
+              return (
+                <button
+                  key={pane.id}
+                  onClick={() => handlePaneSelect(pane.id)}
+                  className="absolute rounded-[5px] border transition-all active:opacity-80 overflow-hidden"
+                  style={{
+                    left: `calc(${r.x * 100}% + 2px)`,
+                    top: `calc(${r.y * 100}% + 2px)`,
+                    width: `calc(${r.w * 100}% - 4px)`,
+                    height: `calc(${r.h * 100}% - 4px)`,
+                    backgroundColor: 'rgba(39,39,42,0.6)',
+                    borderColor: isSel ? ACCENT : '#3f3f46',
+                    borderWidth: isSel ? '2px' : '1px',
+                    boxShadow: isSel ? `0 0 16px ${GLOW}` : 'none',
+                  }}
+                >
+                  <PanePreview content={contentCacheRef.current.get(pane.id)} />
+                  {isSel && <div className="absolute inset-0 pointer-events-none" style={{ backgroundColor: ACCENT + '20' }} />}
+                  <span
+                    className="absolute top-0.5 left-0.5 z-10 flex items-center gap-1 max-w-[calc(100%-4px)] px-1 py-0.5 rounded"
+                    style={{ backgroundColor: isSel ? ACCENT : 'rgba(0,0,0,0.65)' }}
+                  >
+                    <span className="font-bold leading-none" style={{ fontSize: '11px', color: isSel ? '#000' : ACCENT }}>
+                      {idx + 1}
+                    </span>
+                    {pane.name && (
+                      <span className="leading-none truncate" style={{ fontSize: '8px', color: isSel ? '#000' : '#d4d4d8' }}>
+                        {pane.name}
+                      </span>
+                    )}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <span className="text-[10px] text-zinc-600 mt-3 tracking-wider">tap a pane · tap outside to close</span>
+        </div>
+      )}
+
       {/* ── Tab Bar ── */}
       <div className="flex items-center bg-[#0f0f0f] border-b border-zinc-800/60 flex-shrink-0 overflow-x-auto no-scrollbar">
         {tabBarWindow?.tabs.map((tab) => {
@@ -786,7 +830,7 @@ export default function App() {
               onTouchStart={() => { longPressRef.current = setTimeout(() => handleTabLongPress(tab), 500); }}
               onTouchEnd={() => { if (longPressRef.current) clearTimeout(longPressRef.current); }}
               onTouchMove={() => { if (longPressRef.current) clearTimeout(longPressRef.current); }}
-              className={`flex items-center gap-2 text-[11px] tracking-wider transition-all relative flex-shrink-0 active:opacity-70 ${isLandscape ? 'px-3 min-h-[32px]' : 'px-5 min-h-[44px]'}`}
+              className={`flex items-center gap-2 text-[11px] tracking-wider transition-all relative flex-shrink-0 active:opacity-70 border-r border-zinc-700/50 ${isLandscape ? 'px-3 min-h-[32px]' : 'px-5 min-h-[44px]'}`}
               style={{
                 color: isActive ? (splitMode && focusedPane === 'split' ? '#38bdf8' : ACCENT) : '#52525b',
                 backgroundColor: isActive ? (splitMode && focusedPane === 'split' ? '#38bdf810' : ACCENT + '10') : 'transparent',
@@ -799,7 +843,7 @@ export default function App() {
                 />
               )}
               <span className="font-semibold whitespace-nowrap">
-                {tab.sessions[0]?.name || `Tab ${tab.index}`}
+                {tab.title || tab.sessions[0]?.name || `Tab ${tab.index}`}
               </span>
               {isActive && (
                 <div
@@ -857,8 +901,7 @@ export default function App() {
       >
         {/* Primary pane */}
         <div
-          ref={contentRef}
-          className="overflow-auto relative min-h-0 min-w-0"
+          className="overflow-hidden relative min-h-0 min-w-0 flex flex-col"
           onClick={() => splitMode && setFocusedPane('primary')}
           style={{
             borderLeft: `3px solid ${splitMode && focusedPane === 'primary' ? ACCENT : ACCENT + '30'}`,
@@ -869,24 +912,36 @@ export default function App() {
               : { flex: 1 }),
           }}
         >
-          {content ? (
-            <pre className="p-4 text-[12px] leading-[1.7] whitespace-pre-wrap break-words">
-              {coloredLines.map((line, i) => (
-                <span key={i}>
-                  <span style={{ color: line.color, fontWeight: line.bold ? 600 : 400 }}>
-                    {line.text}
-                  </span>
-                  {i < coloredLines.length - 1 ? '\n' : ''}
-                </span>
-              ))}
-              {focusedPane === 'primary' && <span className="cursor-blink" style={{ color: ACCENT }}>█</span>}
-            </pre>
-          ) : (
-            <div className="flex flex-col items-center justify-center h-full gap-3">
-              <Clock className="w-5 h-5 text-zinc-700 animate-pulse" />
-              <span className="text-[11px] text-zinc-700 tracking-wider">WAITING FOR OUTPUT</span>
-            </div>
+          {primaryPanes.length > 1 && (
+            <PaneSwitcher
+              panes={primaryPanes}
+              selectedId={selectedSessionId}
+              onSelect={handlePaneSelect}
+              onOpenMap={handleOpenPaneMap}
+            />
           )}
+          <div ref={contentRef} className="flex-1 overflow-auto relative min-h-0 min-w-0">
+            {content && content.lines.length ? (
+              <pre className="p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full" style={{ color: content.fg, backgroundColor: content.bg }}>
+                {content.lines.map((runs, i) => (
+                  <span key={i}>
+                    {runs.map((r, j) => (
+                      <span key={j} style={{ color: r.f, fontWeight: r.b ? 600 : 400, ...(r.g ? { backgroundColor: r.g } : null) }}>
+                        {r.t}
+                      </span>
+                    ))}
+                    {i < content.lines.length - 1 ? '\n' : ''}
+                  </span>
+                ))}
+                {focusedPane === 'primary' && <span className="cursor-blink" style={{ color: ACCENT }}>█</span>}
+              </pre>
+            ) : (
+              <div className="flex flex-col items-center justify-center h-full gap-3">
+                <Clock className="w-5 h-5 text-zinc-700 animate-pulse" />
+                <span className="text-[11px] text-zinc-700 tracking-wider">WAITING FOR OUTPUT</span>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* Drag divider */}
@@ -919,7 +974,7 @@ export default function App() {
                     onTouchStart={() => { longPressRef.current = setTimeout(() => handleTabLongPress(tab), 500); }}
                     onTouchEnd={() => { if (longPressRef.current) clearTimeout(longPressRef.current); }}
                     onTouchMove={() => { if (longPressRef.current) clearTimeout(longPressRef.current); }}
-                    className={`flex items-center gap-2 text-[10px] tracking-wider transition-all relative flex-shrink-0 active:opacity-70 px-3 min-h-[30px]`}
+                    className={`flex items-center gap-2 text-[10px] tracking-wider transition-all relative flex-shrink-0 active:opacity-70 border-r border-zinc-700/50 px-3 min-h-[30px]`}
                     style={{
                       color: isActive ? '#38bdf8' : '#52525b',
                       backgroundColor: isActive ? '#38bdf810' : 'transparent',
@@ -929,7 +984,7 @@ export default function App() {
                       <div className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ backgroundColor: '#38bdf8' }} />
                     )}
                     <span className="font-semibold whitespace-nowrap">
-                      {tab.sessions[0]?.name || `Tab ${tab.index}`}
+                      {tab.title || tab.sessions[0]?.name || `Tab ${tab.index}`}
                     </span>
                     {isActive && (
                       <div className="absolute bottom-0 left-3 right-3 h-[2px] rounded-full" style={{ backgroundColor: '#38bdf8' }} />
@@ -972,14 +1027,16 @@ export default function App() {
               className="flex-1 overflow-auto relative min-h-0 min-w-0"
               style={{ borderLeft: `3px solid ${focusedPane === 'split' ? '#38bdf8' : '#38bdf830'}` }}
             >
-              {splitContent ? (
-                <pre className="p-4 text-[12px] leading-[1.7] whitespace-pre-wrap break-words">
-                  {splitColoredLines.map((line, i) => (
+              {splitContent && splitContent.lines.length ? (
+                <pre className="p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full" style={{ color: splitContent.fg, backgroundColor: splitContent.bg }}>
+                  {splitContent.lines.map((runs, i) => (
                     <span key={i}>
-                      <span style={{ color: line.color, fontWeight: line.bold ? 600 : 400 }}>
-                        {line.text}
-                      </span>
-                      {i < splitColoredLines.length - 1 ? '\n' : ''}
+                      {runs.map((r, j) => (
+                        <span key={j} style={{ color: r.f, fontWeight: r.b ? 600 : 400, ...(r.g ? { backgroundColor: r.g } : null) }}>
+                          {r.t}
+                        </span>
+                      ))}
+                      {i < splitContent.lines.length - 1 ? '\n' : ''}
                     </span>
                   ))}
                   {focusedPane === 'split' && <span className="cursor-blink" style={{ color: '#38bdf8' }}>█</span>}
@@ -1084,6 +1141,74 @@ export default function App() {
         ::-webkit-scrollbar-track { background: transparent; }
         ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 2px; }
       `}</style>
+    </div>
+  );
+}
+
+// --- Tiny terminal thumbnail shown inside each pane-map cell ---
+// Renders the tail of a pane's cached content in miniature, faithful colors.
+const PanePreview = memo(function PanePreview({ content }: { content?: StyledContent }) {
+  if (!content || !content.lines.length) return null;
+  const lines = content.lines.slice(-28);
+  return (
+    <div className="absolute inset-0 overflow-hidden flex flex-col justify-end" style={{ backgroundColor: content.bg }}>
+      <pre
+        className="whitespace-pre px-1 pb-0.5"
+        style={{ color: content.fg, fontSize: '6px', lineHeight: 1.1, fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
+      >
+        {lines.map((runs, i) => (
+          <div key={i}>
+            {runs.length
+              ? runs.map((r, j) => (
+                  <span key={j} style={{ color: r.f, fontWeight: r.b ? 600 : 400, ...(r.g ? { backgroundColor: r.g } : null) }}>
+                    {r.t}
+                  </span>
+                ))
+              : ' '}
+          </div>
+        ))}
+      </pre>
+    </div>
+  );
+});
+
+// --- Per-tab pane switcher ---
+// Shown only when the selected tab has more than one split pane; tapping a pane
+// makes it fill the primary view (and the client starts live-streaming it).
+function PaneSwitcher({ panes, selectedId, onSelect, onOpenMap }: {
+  panes: Session[];
+  selectedId: string | null;
+  onSelect: (sessionId: string) => void;
+  onOpenMap: () => void;
+}) {
+  return (
+    <div className="flex items-center gap-1 px-2 py-1 bg-[#0c0c0c] border-b border-zinc-800/60 overflow-x-auto no-scrollbar flex-shrink-0">
+      <button
+        onClick={(e) => { e.stopPropagation(); onOpenMap(); }}
+        className="flex items-center gap-1 text-[8px] font-bold tracking-[0.15em] text-zinc-500 hover:text-zinc-300 active:text-zinc-200 pr-1 flex-shrink-0 transition-colors"
+        title="Show pane layout"
+      >
+        <LayoutGrid className="w-2.5 h-2.5" />
+        PANE
+      </button>
+      {panes.map((s, i) => {
+        const active = s.id === selectedId;
+        return (
+          <button
+            key={s.id}
+            onClick={(e) => { e.stopPropagation(); onSelect(s.id); }}
+            className="flex items-center gap-1 px-2 h-6 rounded border text-[10px] font-bold transition-all active:scale-95 flex-shrink-0"
+            style={{
+              color: active ? '#000' : '#a1a1aa',
+              backgroundColor: active ? ACCENT : 'transparent',
+              borderColor: active ? ACCENT : '#3f3f46',
+            }}
+          >
+            <span>{i + 1}</span>
+            {s.name && <span className="font-medium opacity-80 max-w-[90px] truncate">{s.name}</span>}
+          </button>
+        );
+      })}
     </div>
   );
 }
