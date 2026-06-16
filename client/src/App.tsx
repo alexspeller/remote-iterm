@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useMemo, memo } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { Plus, X, Send, Clock, ChevronUp, ChevronDown, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, LayoutGrid } from 'lucide-react';
+import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, LayoutGrid } from 'lucide-react';
 
 // --- Types ---
 interface PaneRect { x: number; y: number; w: number; h: number; }
@@ -1253,6 +1253,13 @@ const KB_SYM2 = [
   ['(',')','[',']','{','}','<','>'],
   [',',';','"',"'",'`','~','\\','_'],
 ];
+// Arrow cluster — sends real ANSI cursor-movement sequences (ESC [ A/B/C/D)
+const KB_ARROWS: { seq: string; Icon: typeof ChevronUp; label: string }[] = [
+  { seq: '\x1b[D', Icon: ChevronLeft, label: 'left' },
+  { seq: '\x1b[A', Icon: ChevronUp, label: 'up' },
+  { seq: '\x1b[B', Icon: ChevronDown, label: 'down' },
+  { seq: '\x1b[C', Icon: ChevronRight, label: 'right' },
+];
 
 function VirtualKeyboard({ onKey, onExit }: { onKey: (key: string) => void; onExit: () => void }) {
   const [shift, setShift] = useState(false);
@@ -1313,6 +1320,19 @@ function VirtualKeyboard({ onKey, onExit }: { onKey: (key: string) => void; onEx
           )}
         </div>
       ))}
+      <div className="flex justify-center gap-1">
+        {KB_ARROWS.map(({ seq, Icon, label }) => (
+          <button
+            key={label}
+            aria-label={label}
+            onClick={() => onKey(seq)}
+            className="flex-1 flex items-center justify-center h-[38px] rounded-md border border-zinc-700/50 bg-zinc-800/60 transition-all active:scale-90 active:bg-zinc-700"
+            style={{ color: '#a78bfa' }}
+          >
+            <Icon className="w-4 h-4" />
+          </button>
+        ))}
+      </div>
       <div className="flex justify-center gap-1">
         <button
           onClick={onExit}
