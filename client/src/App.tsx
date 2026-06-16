@@ -1053,20 +1053,20 @@ export default function App() {
 
       {/* ── Quick Actions ── */}
       <div className={`flex items-center gap-1.5 bg-zinc-950/60 border-t border-zinc-800/40 flex-shrink-0 overflow-x-auto no-scrollbar ${isLandscape ? 'px-2 py-1' : 'px-3 py-2'}`}>
-        <QuickBtn label="ESC" onClick={() => sendSpecialKey('\\x1b')} color="#f87171" />
-        <QuickBtn label="^C" onClick={() => sendSpecialKey('\\x03')} color="#f87171" />
-        <QuickBtn label="^D" onClick={() => sendSpecialKey('\\x04')} color="#fbbf24" />
-        <QuickBtn label="^Z" onClick={() => sendSpecialKey('\\x1a')} color="#fbbf24" />
-        <QuickBtn label="^L" onClick={() => sendSpecialKey('\\x0c')} color="#38bdf8" />
+        <QuickBtn label="ESC" onClick={() => sendSpecialKey('\x1b')} color="#f87171" />
+        <QuickBtn label="^C" onClick={() => sendSpecialKey('\x03')} color="#f87171" />
+        <QuickBtn label="^D" onClick={() => sendSpecialKey('\x04')} color="#fbbf24" />
+        <QuickBtn label="^Z" onClick={() => sendSpecialKey('\x1a')} color="#fbbf24" />
+        <QuickBtn label="^L" onClick={() => sendSpecialKey('\x0c')} color="#38bdf8" />
         <div className="w-px h-5 bg-zinc-800 mx-1 flex-shrink-0" />
-        <QuickBtn icon={<ChevronUp className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\\x1b[A')} color="#a78bfa" />
-        <QuickBtn icon={<ChevronDown className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\\x1b[B')} color="#a78bfa" />
-        <QuickBtn label="TAB" onClick={() => sendSpecialKey('\\t')} color="#818cf8" />
-        <QuickBtn icon={<CornerDownLeft className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\\n')} color="#34d399" />
+        <QuickBtn icon={<ChevronUp className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[A')} color="#a78bfa" />
+        <QuickBtn icon={<ChevronDown className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[B')} color="#a78bfa" />
+        <QuickBtn label="TAB" onClick={() => sendSpecialKey('\t')} color="#818cf8" />
+        <QuickBtn icon={<CornerDownLeft className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\n')} color="#34d399" />
         <div className="w-px h-5 bg-zinc-800 mx-1 flex-shrink-0" />
         <QuickBtn icon={<Clipboard className="w-3.5 h-3.5" />} onClick={handlePaste} color="#38bdf8" />
         <QuickBtn icon={<Copy className="w-3.5 h-3.5" />} onClick={handleCopy} color="#71717a" />
-        <QuickBtn icon={<Trash2 className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\\x15')} color="#fb7185" />
+        <QuickBtn icon={<Trash2 className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x15')} color="#fb7185" />
       </div>
 
       {/* ── Command Input / Virtual Keyboard ── */}
@@ -1305,7 +1305,7 @@ function VirtualKeyboard({ onKey, onExit }: { onKey: (key: string) => void; onEx
           ))}
           {ri === 2 && (
             <button
-              onClick={() => onKey('\\x7f')}
+              onClick={() => onKey('\x7f')}
               className="flex items-center justify-center h-[38px] px-3 rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[11px] font-bold text-zinc-400 transition-all active:scale-90 active:bg-zinc-700"
             >
               DEL
@@ -1347,7 +1347,7 @@ function VirtualKeyboard({ onKey, onExit }: { onKey: (key: string) => void; onEx
           className="flex items-center justify-center w-[30px] h-[38px] rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[13px] font-semibold text-zinc-200 transition-all active:scale-90"
         >.</button>
         <button
-          onClick={() => onKey('\\n')}
+          onClick={() => onKey('\n')}
           className="flex items-center justify-center h-[38px] px-3 rounded-md border transition-all active:scale-90"
           style={{ borderColor: ACCENT + '50', backgroundColor: ACCENT + '15', color: ACCENT }}
         >
