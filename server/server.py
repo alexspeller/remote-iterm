@@ -566,7 +566,9 @@ async def on_execute(sid, data):
     command = data.get("command", "")
     session = resolve_session(data.get("sessionId"))
     if session is not None:
-        await session.async_send_text(command + "\n")
+        # CR (0x0D), not LF: a real Return submits in shells (ICRNL maps CR->NL)
+        # and in raw-mode TUIs like Claude Code, where LF only inserts a newline.
+        await session.async_send_text(command + "\r")
 
 
 @sio.on("broadcast")
@@ -575,7 +577,7 @@ async def on_broadcast(sid, data):
     session_ids = data.get("sessionIds") or []
     sessions = [itermapp.get_session_by_id(s) for s in session_ids] if itermapp else []
     await asyncio.gather(*(
-        s.async_send_text(command + "\n") for s in sessions if s is not None))
+        s.async_send_text(command + "\r") for s in sessions if s is not None))
     await push_state()
 
 

@@ -1062,7 +1062,10 @@ export default function App() {
         <QuickBtn icon={<ChevronUp className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[A')} color="#a78bfa" />
         <QuickBtn icon={<ChevronDown className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[B')} color="#a78bfa" />
         <QuickBtn label="TAB" onClick={() => sendSpecialKey('\t')} color="#818cf8" />
-        <QuickBtn icon={<CornerDownLeft className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\n')} color="#34d399" />
+        {/* Real Return (CR, 0x0D): submits in shells AND raw-mode TUIs like Claude Code */}
+        <QuickBtn icon={<CornerDownLeft className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\r')} color="#34d399" />
+        {/* Newline (LF, 0x0A): the Shift+Enter equivalent — inserts a line without submitting */}
+        <QuickBtn label="⇧↵" onClick={() => sendSpecialKey('\n')} color="#14b8a6" />
         <div className="w-px h-5 bg-zinc-800 mx-1 flex-shrink-0" />
         <QuickBtn icon={<Clipboard className="w-3.5 h-3.5" />} onClick={handlePaste} color="#38bdf8" />
         <QuickBtn icon={<Copy className="w-3.5 h-3.5" />} onClick={handleCopy} color="#71717a" />
@@ -1366,9 +1369,19 @@ function VirtualKeyboard({ onKey, onExit }: { onKey: (key: string) => void; onEx
           onClick={() => onKey('.')}
           className="flex items-center justify-center w-[30px] h-[38px] rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[13px] font-semibold text-zinc-200 transition-all active:scale-90"
         >.</button>
+        {/* Newline (LF, 0x0A) — Shift+Enter equivalent: inserts a line without submitting */}
         <button
           onClick={() => onKey('\n')}
-          className="flex items-center justify-center h-[38px] px-3 rounded-md border transition-all active:scale-90"
+          aria-label="newline"
+          className="flex items-center justify-center h-[38px] px-3 rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[13px] font-bold text-zinc-300 transition-all active:scale-90 active:bg-zinc-700"
+        >
+          ⇧↵
+        </button>
+        {/* Real Return (CR, 0x0D) — submits in shells AND raw-mode TUIs like Claude Code */}
+        <button
+          onClick={() => onKey('\r')}
+          aria-label="return"
+          className="flex items-center justify-center h-[38px] px-4 rounded-md border transition-all active:scale-90"
           style={{ borderColor: ACCENT + '50', backgroundColor: ACCENT + '15', color: ACCENT }}
         >
           <CornerDownLeft className="w-4 h-4" />
