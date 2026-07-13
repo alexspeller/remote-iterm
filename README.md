@@ -74,6 +74,7 @@ For the component model, data flow, Socket.IO contract, and design trade-offs, s
 - Live terminal output with profile-aware ANSI and true-color rendering
 - Visible cursor, bold, faint, inverse, and background styles
 - Tab creation, closing, selection, and long-press rename
+- Horizontal tab strips with a touch-friendly vertical tab picker
 - Spatial split-pane switcher with live previews
 - Two-session view with an adjustable divider and independent focus
 - Multi-window spatial map

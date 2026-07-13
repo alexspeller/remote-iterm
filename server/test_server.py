@@ -1,6 +1,6 @@
 import unittest
 
-from server.server import _DEFAULT_PALETTE, _available_line_range, _line_runs
+from server.server import _DEFAULT_PALETTE, _content_line_range, _line_runs
 
 
 class _DefaultColor:
@@ -50,14 +50,28 @@ class LineRunsTest(unittest.TestCase):
         )
 
 
-class AvailableLineRangeTest(unittest.TestCase):
-    def test_includes_all_retained_scrollback_and_screen_lines(self):
+class ContentLineRangeTest(unittest.TestCase):
+    def test_returns_latest_bounded_page(self):
         class Info:
             overflow = 275
             scrollback_buffer_height = 10_000
             mutable_area_height = 40
 
-        self.assertEqual(_available_line_range(Info()), (275, 10_040))
+        self.assertEqual(
+            _content_line_range(Info(), 250),
+            (10_065, 250, 275, 10_315),
+        )
+
+    def test_pages_back_to_the_first_retained_line(self):
+        class Info:
+            overflow = 275
+            scrollback_buffer_height = 10_000
+            mutable_area_height = 40
+
+        self.assertEqual(
+            _content_line_range(Info(), 500, before_line=600),
+            (275, 325, 275, 10_315),
+        )
 
 
 if __name__ == "__main__":

@@ -39,13 +39,14 @@ The backend runs `python-socketio` on `aiohttp` alongside one iTerm2 API connect
 - Reconstruct nested split-pane rectangles by walking iTerm2's splitter tree.
 - Subscribe to layout and focus notifications.
 - Run one screen-stream task per session watched by at least one connected client.
-- Read all scrollback retained by each iTerm session plus its current screen, and encode it as compact styled runs.
+- Read a bounded live tail for watched sessions and encode it as compact styled runs.
+- Page older scrollback from iTerm only when the client approaches the top of its currently loaded history.
 - Resolve terminal colors through the session's profile and the xterm 256-color palette.
 - Route commands and raw key bytes to a specific session.
 
 State changes are pushed when iTerm2 reports them. A two-second synchronization loop covers job-title changes and pure window moves that do not have a suitable notification; serialized state is compared with the last value before anything is emitted.
 
-Screen streaming is based on the union of every client's `watch` list. This means two phones watching the same pane share one backend stream task, while an unwatched background pane consumes no continuous screen-reading work.
+Screen streaming is based on the union of every client's `watch` list. This means two phones watching the same pane share one backend stream task, while an unwatched background pane consumes no continuous screen-reading work. Each live update contains only the most recent 250 lines; pane-map previews request 40 lines, and older history loads in 500-line pages. This prevents large or unlimited iTerm histories from being read and retransmitted on every screen change while still making all retained scrollback reachable.
 
 ### React client (`client/`)
 
@@ -56,6 +57,7 @@ The Vite/React client maintains the selected window, tab, and session separately
 - Follows live output only while a pane is already scrolled to the bottom, preserving the reader's position when they scroll back.
 - Tells the backend exactly which primary and secondary sessions need live updates.
 - Renders a tab's real split geometry as a spatial picker.
+- Offers both horizontal tab strips and vertical tab lists for fast selection.
 - Sends all input to the currently focused mobile pane.
 - Stores command history only in browser `localStorage`.
 - Reconnects indefinitely and measures Socket.IO round-trip latency.
@@ -70,10 +72,12 @@ The protocol intentionally evolves the upstream event names where possible so th
 | --- | --- | --- |
 | server → client | `state` | Complete window, tab, pane, focus, and geometry snapshot |
 | server → client | `screenSize` | Mac display dimensions used by the spatial window map |
-| server → client | `content` | Styled terminal lines for one session |
+| server → client | `content` | Styled live-tail or preview lines for one session |
+| server → client | `historyContent` | An older page of styled terminal lines to prepend |
 | client → server | `watch` | Replace the client's set of live-streamed session IDs |
 | client → server | `getContent` | Request one immediate session snapshot |
 | client → server | `getAllContent` | Request snapshots used for background previews |
+| client → server | `getEarlierContent` | Request the page before the oldest currently loaded line |
 | client → server | `execute` | Send a command followed by carriage return to one session |
 | client → server | `sendKeys` | Send raw characters or terminal escape/control bytes |
 | client → server | `broadcast` | Execute a command in a list of sessions |

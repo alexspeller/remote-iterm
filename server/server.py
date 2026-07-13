@@ -25,6 +25,13 @@ except Exception:  # pragma: no cover - pyobjc should always be present
 
 PORT = 7291
 
+# Watched panes receive only their recent tail on each screen change. Older
+# content is fetched in pages when the client scrolls upward, avoiding a full
+# scrollback read (and a large Socket.IO payload) for every keypress.
+LIVE_CONTENT_LINES = 250
+HISTORY_PAGE_LINES = 500
+PREVIEW_CONTENT_LINES = 40
+
 sio = socketio.AsyncServer(async_mode="aiohttp", cors_allowed_origins="*")
 app = web.Application()
 sio.attach(app)
@@ -381,20 +388,31 @@ def _make_run(key, text: str) -> dict:
     return run
 
 
-def _available_line_range(info) -> tuple[int, int]:
-    """Return the complete range still retained by the iTerm session.
+def _content_line_range(
+        info, line_count: int, before_line: int | None = None
+) -> tuple[int, int, int, int]:
+    """Return a page within the complete range retained by iTerm.
 
     Absolute line numbers below ``overflow`` have already been discarded by
     iTerm. Everything after it consists of the session's scrollback plus its
     mutable screen area and is available through ``async_get_contents``.
     """
-    return (
-        info.overflow,
-        info.scrollback_buffer_height + info.mutable_area_height,
-    )
+    available_first = info.overflow
+    terminal_end = (available_first + info.scrollback_buffer_height
+                    + info.mutable_area_height)
+    page_end = terminal_end
+    if before_line is not None:
+        page_end = min(page_end, max(available_first, before_line))
+    first = max(available_first, page_end - line_count)
+    return first, page_end - first, available_first, terminal_end
 
 
-async def read_content(session_id: str | None) -> dict | None:
+async def read_content(
+        session_id: str | None,
+        line_count: int = LIVE_CONTENT_LINES,
+        before_line: int | None = None,
+        screen=None,
+) -> dict | None:
     if itermapp is None or not session_id or session_id == "undefined":
         return None
     session = itermapp.get_session_by_id(session_id)
@@ -404,19 +422,29 @@ async def read_content(session_id: str | None) -> dict | None:
         pal = await get_palette(session)
         async with iterm2.Transaction(connection):
             info = await session.async_get_line_info()
-            screen = await session.async_get_screen_contents()
-            first, count = _available_line_range(info)
+            if screen is None:
+                screen = await session.async_get_screen_contents()
+            first, count, available_first, terminal_end = _content_line_range(
+                info, line_count, before_line)
             if count <= 0:
-                return {"lines": [], "fg": pal["fg"], "bg": pal["bg"]}
+                return {
+                    "lines": [], "fg": pal["fg"], "bg": pal["bg"],
+                    "firstLine": first, "availableFirstLine": available_first,
+                    "terminalEnd": terminal_end,
+                    "isLatest": before_line is None,
+                }
             lines = await session.async_get_contents(first, count)
         cursor = screen.cursor_coord
         rendered = [
             _line_runs(line, pal, cursor.x if first + i == cursor.y else None)
             for i, line in enumerate(lines)
         ]
-        while rendered and not rendered[-1]:
-            rendered.pop()
-        return {"lines": rendered, "fg": pal["fg"], "bg": pal["bg"]}
+        return {
+            "lines": rendered, "fg": pal["fg"], "bg": pal["bg"],
+            "firstLine": first, "availableFirstLine": available_first,
+            "terminalEnd": terminal_end,
+            "isLatest": before_line is None,
+        }
     except Exception:
         return None
 
@@ -464,10 +492,12 @@ async def stream_session(session_id: str) -> None:
     try:
         async with session.get_screen_streamer() as streamer:
             while True:
-                await streamer.async_get()
+                screen = await streamer.async_get()
                 if not clients:
                     continue
-                content = await read_content(session_id)
+                # Reuse the streamer's current-screen snapshot for cursor
+                # placement instead of requesting the screen a second time.
+                content = await read_content(session_id, screen=screen)
                 if content is not None and content != last_content.get(session_id):
                     last_content[session_id] = content
                     await sio.emit(
@@ -580,12 +610,25 @@ async def on_get_all_content(sid, data):
     session_ids = data.get("sessionIds") or []
 
     async def one(session_id):
-        content = await read_content(session_id)
+        content = await read_content(session_id, PREVIEW_CONTENT_LINES)
         if content and content["lines"]:
             await sio.emit(
                 "content", {"sessionId": session_id, **content}, to=sid)
 
     await asyncio.gather(*(one(s) for s in session_ids))
+
+
+@sio.on("getEarlierContent")
+async def on_get_earlier_content(sid, data):
+    session_id = data.get("sessionId")
+    before_line = data.get("beforeLine")
+    if not isinstance(before_line, int):
+        return
+    content = await read_content(
+        session_id, HISTORY_PAGE_LINES, before_line=before_line)
+    if content:
+        await sio.emit(
+            "historyContent", {"sessionId": session_id, **content}, to=sid)
 
 
 @sio.on("execute")

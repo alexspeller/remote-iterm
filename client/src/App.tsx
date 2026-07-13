@@ -1,6 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, memo } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, LayoutGrid } from 'lucide-react';
+import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, LayoutGrid, List as ListIcon } from 'lucide-react';
 
 // --- Types ---
 interface PaneRect { x: number; y: number; w: number; h: number; }
@@ -13,7 +13,15 @@ interface ScreenSize { width: number; height: number; }
 // A run of text sharing one style: t=text, f=fg hex, g=bg hex, b=bold, d=dim.
 // f/g omitted means "use the pane default" (theme fg/bg).
 interface Run { t: string; f?: string; g?: string; b?: boolean; d?: boolean; c?: boolean }
-interface StyledContent { lines: Run[][]; fg: string; bg: string }
+interface StyledContent {
+  lines: Run[][];
+  fg: string;
+  bg: string;
+  firstLine: number;
+  availableFirstLine: number;
+  terminalEnd: number;
+  isLatest: boolean;
+}
 
 const ACCENT = '#10b981';
 const BROADCAST_COLOR = '#818cf8';
@@ -29,6 +37,50 @@ const BOTTOM_THRESHOLD_PX = 4;
 
 function isScrolledToBottom(element: HTMLDivElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_THRESHOLD_PX;
+}
+
+function mergeStyledContent(current: StyledContent | undefined, incoming: StyledContent): StyledContent {
+  if (!current) return incoming;
+
+  const currentEnd = current.firstLine + current.lines.length;
+  const incomingEnd = incoming.firstLine + incoming.lines.length;
+  // A gap means output advanced beyond the live-tail window before this client
+  // received an update. Use the authoritative tail; the gap remains available
+  // through normal upward pagination.
+  if (incoming.firstLine > currentEnd || current.firstLine > incomingEnd) return incoming;
+
+  const firstLine = Math.max(
+    incoming.availableFirstLine,
+    Math.min(current.firstLine, incoming.firstLine),
+  );
+  const endLine = Math.min(
+    incoming.terminalEnd,
+    Math.max(currentEnd, incomingEnd),
+  );
+  const lines: Run[][] = Array.from({ length: Math.max(0, endLine - firstLine) }, () => []);
+
+  const copy = (source: Run[][], sourceFirst: number, removeCursor: boolean) => {
+    source.forEach((runs, index) => {
+      const target = sourceFirst + index - firstLine;
+      if (target < 0 || target >= lines.length) return;
+      lines[target] = removeCursor ? runs.filter(run => !run.c) : runs;
+    });
+  };
+
+  // A live update carries the current cursor, so remove the stale cursor from
+  // any preserved history before overwriting the recent tail.
+  copy(current.lines, current.firstLine, incoming.isLatest);
+  copy(incoming.lines, incoming.firstLine, false);
+
+  return {
+    lines,
+    fg: incoming.fg,
+    bg: incoming.bg,
+    firstLine,
+    availableFirstLine: incoming.availableFirstLine,
+    terminalEnd: incoming.terminalEnd,
+    isLatest: current.isLatest || incoming.isLatest,
+  };
 }
 
 function loadHistory(): string[] {
@@ -71,6 +123,7 @@ export default function App() {
   const [splitTabId, setSplitTabId] = useState<string | null>(null);
   const [showSplitMap, setShowSplitMap] = useState(false);
   const [showPaneMap, setShowPaneMap] = useState(false);
+  const [tabListTarget, setTabListTarget] = useState<'tabBar' | 'split' | null>(null);
   // Bumped to re-render the pane map's content thumbnails when cached pane
   // content arrives (cache lives in a ref, so it can't trigger renders itself).
   const [, setPreviewTick] = useState(0);
@@ -79,6 +132,10 @@ export default function App() {
   const splitContentRef = useRef<HTMLDivElement>(null);
   const primaryAtBottomRef = useRef(true);
   const splitAtBottomRef = useRef(true);
+  const primaryHistoryLoadingRef = useRef(false);
+  const splitHistoryLoadingRef = useRef(false);
+  const primaryPrependRef = useRef<{ height: number; top: number } | null>(null);
+  const splitPrependRef = useRef<{ height: number; top: number } | null>(null);
   const splitContainerRef = useRef<HTMLDivElement>(null);
   const stateRef = useRef(state);
   const winIdRef = useRef(selectedWinId);
@@ -92,7 +149,6 @@ export default function App() {
   const contentChangingRef = useRef(false);
   const alertTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const contentCacheRef = useRef<Map<string, StyledContent>>(new Map());
-  const lastBgFetchRef = useRef(0);
   const splitSessionIdRef = useRef(splitSessionId);
   const focusedPaneRef = useRef(focusedPane);
   const splitWinIdRef = useRef(splitWinId);
@@ -173,38 +229,60 @@ export default function App() {
         }
       }
 
-      // Refresh content for ALL background sessions across ALL windows (throttled to every 3s)
-      if (Date.now() - lastBgFetchRef.current > 3000) {
-        const activeSid = selectedSessionIdRef.current;
-        const bgIds = newState
-          .flatMap(w => w.tabs.map(t => t.sessions[0]?.id))
-          .filter((sid): sid is string => !!sid && sid !== activeSid);
-        if (bgIds.length > 0) {
-          lastBgFetchRef.current = Date.now();
-          s.emit('getAllContent', { sessionIds: bgIds });
-        }
-      }
     });
 
     s.on('content', (data: { sessionId?: string } & StyledContent) => {
-      const styled: StyledContent = { lines: data.lines, fg: data.fg, bg: data.bg };
+      const styled: StyledContent = {
+        lines: data.lines,
+        fg: data.fg,
+        bg: data.bg,
+        firstLine: data.firstLine,
+        availableFirstLine: data.availableFirstLine,
+        terminalEnd: data.terminalEnd,
+        isLatest: data.isLatest,
+      };
       if (data.sessionId) {
-        contentCacheRef.current.set(data.sessionId, styled);
+        const merged = mergeStyledContent(contentCacheRef.current.get(data.sessionId), styled);
+        contentCacheRef.current.set(data.sessionId, merged);
         // Refresh the pane map's thumbnails while it's open (cached content for
         // non-viewed panes doesn't otherwise trigger a render).
         if (paneMapOpenRef.current) setPreviewTick(t => t + 1);
         // Update split pane if this is the split session
         if (data.sessionId === splitSessionIdRef.current) {
-          setSplitContent(styled);
+          setSplitContent(merged);
         }
         // Only update main content if it's the pane we're viewing (which may be
         // any pane in the selected tab, not just the first).
         if (data.sessionId !== selectedSessionIdRef.current) return;
+        setContent(merged);
+      } else {
+        setContent(styled);
       }
-      setContent(styled);
       // Track content changes for long-running command alerts
       lastContentTimeRef.current = Date.now();
       contentChangingRef.current = true;
+    });
+
+    s.on('historyContent', (data: { sessionId: string } & StyledContent) => {
+      const merged = mergeStyledContent(contentCacheRef.current.get(data.sessionId), data);
+      contentCacheRef.current.set(data.sessionId, merged);
+
+      if (data.sessionId === selectedSessionIdRef.current) {
+        const element = contentRef.current;
+        if (element) {
+          primaryPrependRef.current = { height: element.scrollHeight, top: element.scrollTop };
+        }
+        primaryHistoryLoadingRef.current = false;
+        setContent(merged);
+      }
+      if (data.sessionId === splitSessionIdRef.current) {
+        const element = splitContentRef.current;
+        if (element) {
+          splitPrependRef.current = { height: element.scrollHeight, top: element.scrollTop };
+        }
+        splitHistoryLoadingRef.current = false;
+        setSplitContent(merged);
+      }
     });
 
     return () => { s.disconnect(); };
@@ -260,22 +338,32 @@ export default function App() {
   // not undone by a live content update.
   useLayoutEffect(() => {
     primaryAtBottomRef.current = true;
+    primaryHistoryLoadingRef.current = false;
   }, [selectedSessionId]);
 
   useLayoutEffect(() => {
     splitAtBottomRef.current = true;
+    splitHistoryLoadingRef.current = false;
   }, [splitSessionId]);
 
   useLayoutEffect(() => {
     const element = contentRef.current;
-    if (!scrollLocked && primaryAtBottomRef.current && element) {
+    const prepend = primaryPrependRef.current;
+    if (element && prepend) {
+      element.scrollTop = prepend.top + element.scrollHeight - prepend.height;
+      primaryPrependRef.current = null;
+    } else if (!scrollLocked && primaryAtBottomRef.current && element) {
       element.scrollTop = element.scrollHeight;
     }
   }, [content, scrollLocked]);
 
   useLayoutEffect(() => {
     const element = splitContentRef.current;
-    if (!scrollLocked && splitAtBottomRef.current && element) {
+    const prepend = splitPrependRef.current;
+    if (element && prepend) {
+      element.scrollTop = prepend.top + element.scrollHeight - prepend.height;
+      splitPrependRef.current = null;
+    } else if (!scrollLocked && splitAtBottomRef.current && element) {
       element.scrollTop = element.scrollHeight;
     }
   }, [splitContent, scrollLocked]);
@@ -462,6 +550,23 @@ export default function App() {
     setShowPaneMap(true);
     const ids = primaryPanes.map(p => p.id).filter(Boolean);
     if (ids.length) socketRef.current?.emit('getAllContent', { sessionIds: ids });
+  };
+
+  const loadEarlierContent = (
+    pane: 'primary' | 'split',
+    sessionId: string | null,
+    styled: StyledContent | null,
+    element: HTMLDivElement,
+  ) => {
+    if (!sessionId || !styled || element.scrollTop > 80) return;
+    if (styled.firstLine <= styled.availableFirstLine) return;
+    const loadingRef = pane === 'primary' ? primaryHistoryLoadingRef : splitHistoryLoadingRef;
+    if (loadingRef.current) return;
+    loadingRef.current = true;
+    socketRef.current?.emit('getEarlierContent', {
+      sessionId,
+      beforeLine: styled.firstLine,
+    });
   };
 
   // Switch which pane (split session) of the current tab fills the primary view.
@@ -843,6 +948,14 @@ export default function App() {
 
       {/* ── Tab Bar ── */}
       <div className="flex items-center bg-[#0f0f0f] border-b border-zinc-800/60 flex-shrink-0 overflow-x-auto no-scrollbar">
+        <button
+          onClick={() => setTabListTarget(tabListTarget === 'tabBar' ? null : 'tabBar')}
+          className={`sticky left-0 z-10 flex flex-shrink-0 items-center justify-center border-r border-zinc-700/50 bg-[#0f0f0f] text-zinc-500 active:text-zinc-200 ${isLandscape ? 'w-9 min-h-[32px]' : 'w-11 min-h-[44px]'}`}
+          aria-label="Show tabs as a list"
+          title="Show tabs as a list"
+        >
+          <ListIcon className="w-4 h-4" />
+        </button>
         {tabBarWindow?.tabs.map((tab) => {
           const isActive = tabBarSelectedTabId === tab.id;
           return (
@@ -946,6 +1059,7 @@ export default function App() {
             ref={contentRef}
             onScroll={(event) => {
               primaryAtBottomRef.current = isScrolledToBottom(event.currentTarget);
+              loadEarlierContent('primary', selectedSessionId, content, event.currentTarget);
             }}
             className="flex-1 overflow-auto relative min-h-0 min-w-0"
           >
@@ -998,6 +1112,17 @@ export default function App() {
           >
             {/* Split pane tab bar */}
             <div className="flex items-center bg-[#0f0f0f] border-b border-zinc-800/60 flex-shrink-0 overflow-x-auto no-scrollbar">
+              <button
+                onClick={(event) => {
+                  event.stopPropagation();
+                  setTabListTarget(tabListTarget === 'split' ? null : 'split');
+                }}
+                className="sticky left-0 z-10 flex w-8 min-h-[30px] flex-shrink-0 items-center justify-center border-r border-zinc-700/50 bg-[#0f0f0f] text-zinc-500 active:text-zinc-200"
+                aria-label="Show split-pane tabs as a list"
+                title="Show tabs as a list"
+              >
+                <ListIcon className="w-3.5 h-3.5" />
+              </button>
               {splitWindow?.tabs.map((tab) => {
                 const isActive = splitTabId === tab.id;
                 return (
@@ -1059,6 +1184,7 @@ export default function App() {
               ref={splitContentRef}
               onScroll={(event) => {
                 splitAtBottomRef.current = isScrolledToBottom(event.currentTarget);
+                loadEarlierContent('split', splitSessionId, splitContent, event.currentTarget);
               }}
               className="flex-1 overflow-auto relative min-h-0 min-w-0"
               style={{ borderLeft: `3px solid ${focusedPane === 'split' ? '#38bdf8' : '#38bdf830'}` }}
@@ -1091,6 +1217,32 @@ export default function App() {
           </div>
         )}
       </div>
+
+      {tabListTarget === 'tabBar' && tabBarWindow && (
+        <TabListOverlay
+          tabs={tabBarWindow.tabs}
+          selectedId={tabBarSelectedTabId}
+          accent={splitMode && focusedPane === 'split' ? '#38bdf8' : ACCENT}
+          onSelect={(tab) => {
+            handleTabClick(tabBarWindow.id, tab);
+            setTabListTarget(null);
+          }}
+          onClose={() => setTabListTarget(null)}
+        />
+      )}
+
+      {tabListTarget === 'split' && splitWindow && (
+        <TabListOverlay
+          tabs={splitWindow.tabs}
+          selectedId={splitTabId}
+          accent="#38bdf8"
+          onSelect={(tab) => {
+            handleSplitTabClick(tab);
+            setTabListTarget(null);
+          }}
+          onClose={() => setTabListTarget(null)}
+        />
+      )}
 
       {/* ── Quick Actions ── */}
       <div className={`flex items-center gap-1.5 bg-zinc-950/60 border-t border-zinc-800/40 flex-shrink-0 overflow-x-auto no-scrollbar ${isLandscape ? 'px-2 py-1' : 'px-3 py-2'}`}>
@@ -1186,6 +1338,72 @@ export default function App() {
         ::-webkit-scrollbar-track { background: transparent; }
         ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 2px; }
       `}</style>
+    </div>
+  );
+}
+
+function TabListOverlay({ tabs, selectedId, accent, onSelect, onClose }: {
+  tabs: Tab[];
+  selectedId: string | null;
+  accent: string;
+  onSelect: (tab: Tab) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-[70] flex items-start justify-center px-4 pt-[max(5rem,env(safe-area-inset-top))]"
+      onClick={onClose}
+      style={{ backgroundColor: 'rgba(0,0,0,0.82)', backdropFilter: 'blur(10px)', WebkitBackdropFilter: 'blur(10px)' }}
+    >
+      <div
+        className="w-full max-w-md overflow-hidden rounded-xl border border-zinc-700/60 bg-[#111113] shadow-2xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3">
+          <span className="text-[10px] font-bold tracking-[0.2em] text-zinc-500">
+            SELECT TAB · {tabs.length}
+          </span>
+          <button
+            onClick={onClose}
+            className="flex h-7 w-7 items-center justify-center rounded-md text-zinc-600 active:bg-zinc-800 active:text-zinc-300"
+            aria-label="Close tab list"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <div className="max-h-[65vh] overflow-y-auto p-2">
+          {tabs.map((tab) => {
+            const isActive = tab.id === selectedId;
+            return (
+              <button
+                key={tab.id}
+                onClick={() => onSelect(tab)}
+                className="flex min-h-[48px] w-full items-center gap-3 rounded-lg px-3 text-left transition-colors active:bg-zinc-800"
+                style={{ backgroundColor: isActive ? accent + '12' : 'transparent' }}
+              >
+                <span
+                  className="flex h-6 w-6 flex-shrink-0 items-center justify-center rounded-md text-[10px] font-bold tabular-nums"
+                  style={{ color: isActive ? '#09090b' : '#71717a', backgroundColor: isActive ? accent : '#27272a' }}
+                >
+                  {tab.index}
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span
+                    className="block truncate text-[12px] font-semibold tracking-wide"
+                    style={{ color: isActive ? accent : '#a1a1aa' }}
+                  >
+                    {tab.title || tab.sessions[0]?.name || `Tab ${tab.index}`}
+                  </span>
+                  <span className="mt-0.5 block text-[9px] text-zinc-600">
+                    {tab.sessions.length} pane{tab.sessions.length === 1 ? '' : 's'}
+                  </span>
+                </span>
+                {isActive && <span className="h-2 w-2 flex-shrink-0 rounded-full" style={{ backgroundColor: accent }} />}
+              </button>
+            );
+          })}
+        </div>
+      </div>
     </div>
   );
 }
