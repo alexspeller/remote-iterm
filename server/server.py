@@ -5,8 +5,9 @@ Replaces the previous AppleScript/osascript implementation. A single asyncio
 loop runs both the Socket.IO server (for the web/phone client) and the iTerm2
 connection. Terminal output and window/tab state are PUSHED from iTerm2's
 notification streams instead of being polled, so no per-call processes are
-spawned. The Socket.IO event contract is identical to the old Node server, so
-the client is unchanged.
+spawned. The Socket.IO contract retains the upstream event vocabulary while
+adding pane watches and structured, styled terminal content for the rewritten
+client.
 """
 import asyncio
 import json
@@ -515,7 +516,7 @@ async def focus_monitor() -> None:
             await push_state()
 
 
-# --- Socket.IO handlers (identical contract to the old Node server) -------------
+# --- Socket.IO handlers ---------------------------------------------------------
 
 @sio.event
 async def connect(sid, environ, auth=None):

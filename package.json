@@ -1,7 +1,7 @@
 {
   "name": "remote-iterm",
   "version": "1.0.1",
-  "description": "Control iTerm2 from your phone over local network",
+  "description": "Control iTerm2 from your phone with a native, event-driven iTerm2 integration",
   "bin": {
     "remote-iterm": "iterm-server"
   },
@@ -18,15 +18,24 @@
     "remote",
     "macos",
     "mobile",
-    "applescript"
+    "python",
+    "iterm2-api",
+    "socket.io",
+    "pwa"
   ],
-  "author": "mammadovziya",
+  "author": "Alex Speller",
+  "contributors": [
+    "Ziya Mammadov (https://github.com/mammadovziya)"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mammadovziya/remote-iterm.git"
+    "url": "git+https://github.com/alexspeller/remote-iterm.git"
   },
-  "homepage": "https://github.com/mammadovziya/remote-iterm#readme",
+  "homepage": "https://github.com/alexspeller/remote-iterm#readme",
+  "bugs": {
+    "url": "https://github.com/alexspeller/remote-iterm/issues"
+  },
   "os": [
     "darwin"
   ],
@@ -38,8 +47,12 @@
     "server/",
     "client/",
     "!server/.venv",
+    "!server/__pycache__",
+    "!server/**/*.pyc",
     "!client/node_modules",
     "!client/dist",
-    "README.md"
+    "README.md",
+    "LICENSE",
+    "docs/"
   ]
 }

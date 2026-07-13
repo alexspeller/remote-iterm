@@ -256,6 +256,22 @@
             font-weight: 600;
         }
 
+        .fork-credit {
+            max-width: 680px;
+            margin: -24px 0 36px;
+            padding: 12px 16px;
+            border-left: 2px solid var(--purple);
+            background: rgba(167, 139, 250, 0.06);
+            color: var(--muted2);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            line-height: 1.7;
+        }
+
+        .fork-credit a {
+            color: var(--purple);
+        }
+
         .hero-actions {
             display: flex;
             align-items: center;
@@ -956,7 +972,7 @@
             <li><a href="#features">Features</a></li>
             <li><a href="#install">Install</a></li>
         </ul>
-        <a href="#install" class="nav-cta">npm install</a>
+        <a href="#install" class="nav-cta">install fork</a>
     </nav>
 
     <!-- Hero -->
@@ -975,8 +991,13 @@
                 Long deploy running? Walk away. <strong>Your terminal lives on your phone now.</strong>
                 Split panes, tab management, quick actions — the whole thing.
             </p>
+            <p class="fork-credit">
+                A substantial rewrite of
+                <a href="https://github.com/mammadovziya/remote-iterm" target="_blank">Ziya Mammadov's original remote-iterm</a>.
+                The original project supplied the idea, interface, CLI, and feature foundation.
+            </p>
             <div class="hero-actions">
-                <a href="#install" class="btn-primary">npm install -g remote-iterm →</a>
+                <a href="#install" class="btn-primary">install this fork →</a>
                 <a href="#demo" class="btn-secondary">
                     <span>↓</span> see the interface
                 </a>
@@ -987,12 +1008,12 @@
                     <div class="label">to start</div>
                 </div>
                 <div class="hero-stat">
-                    <div class="num">&lt;5<span>ms</span></div>
-                    <div class="label">local latency</div>
+                    <div class="num">PUSH</div>
+                    <div class="label">event-driven output</div>
                 </div>
                 <div class="hero-stat">
-                    <div class="num">20<span>+</span></div>
-                    <div class="label">features</div>
+                    <div class="num">2<span>panes</span></div>
+                    <div class="label">independent control</div>
                 </div>
                 <div class="hero-stat">
                     <div class="num">PWA</div>
@@ -1024,11 +1045,11 @@
                 </div>
                 <div class="phone-tabs">
                     <div class="phone-tab active">zsh</div>
-                    <div class="phone-tab">node</div>
+                    <div class="phone-tab">python</div>
                     <div class="phone-tab">logs</div>
                 </div>
                 <div class="phone-terminal">
-                    <div><span class="p">ziya@mbp</span> <span class="d">~/project</span></div>
+                    <div><span class="p">dev@mbp</span> <span class="d">~/project</span></div>
                     <div><span class="b">$</span> <span class="w">npm run deploy</span></div>
                     <div class="d">&nbsp;</div>
                     <div><span class="g">✓</span> <span class="w">Building production bundle...</span></div>
@@ -1037,7 +1058,7 @@
                     <div class="d">&nbsp;</div>
                     <div><span class="g">deployed</span> <span class="b">https://app.example.com</span></div>
                     <div class="d">&nbsp;</div>
-                    <div><span class="p">ziya@mbp</span> <span class="d">~/project</span></div>
+                    <div><span class="p">dev@mbp</span> <span class="d">~/project</span></div>
                     <div><span class="b">$</span> <span class="cursor-block"></span></div>
                 </div>
                 <div class="phone-qbar">
@@ -1067,14 +1088,14 @@
         <div class="how-inner">
             <div class="section-eyebrow">setup</div>
             <h2 class="section-title">Three steps.<br><span>That's it.</span></h2>
-            <p class="section-sub">No config files, no auth, no cloud. Just your Mac and your phone on the same network.</p>
+            <p class="section-sub">No cloud or config files. Use it only on a trusted local network: the service does not currently provide authentication or TLS.</p>
 
             <div class="steps-row">
                 <div class="step-card" style="--step-color: var(--accent)">
                     <div class="step-num">01</div>
                     <div class="step-icon">⬇</div>
                     <h3>Install</h3>
-                    <p>One command: <code>npm i -g remote-iterm</code>. That's your global CLI ready.</p>
+                    <p>Install this rewrite directly from its GitHub fork with npm.</p>
                 </div>
                 <div class="step-card" style="--step-color: var(--cyan)">
                     <div class="step-num">02</div>
@@ -1103,7 +1124,7 @@
                 <div class="feature-card" style="--feat-color: var(--accent)">
                     <span class="feat-icon">🖥</span>
                     <h3>Real-time output</h3>
-                    <p>Terminal content streams live with syntax coloring</p>
+                    <p>Native iTerm2 screen streams replace AppleScript polling</p>
                 </div>
                 <div class="feature-card" style="--feat-color: var(--cyan)">
                     <span class="feat-icon">📑</span>
@@ -1118,7 +1139,7 @@
                 <div class="feature-card" style="--feat-color: var(--purple)">
                     <span class="feat-icon">⬜</span>
                     <h3>Split pane</h3>
-                    <p>View 2 sessions at once with independent controls</p>
+                    <p>View and control two sessions with real pane geometry</p>
                 </div>
                 <div class="feature-card" style="--feat-color: var(--accent)">
                     <span class="feat-icon">📡</span>
@@ -1142,8 +1163,8 @@
                 </div>
                 <div class="feature-card" style="--feat-color: var(--accent)">
                     <span class="feat-icon">📱</span>
-                    <h3>PWA</h3>
-                    <p>Add to home screen for native app feel</p>
+                    <h3>Terminal fidelity</h3>
+                    <p>Profile colors, styled cells, and the live terminal cursor</p>
                 </div>
                 <div class="feature-card" style="--feat-color: var(--cyan)">
                     <span class="feat-icon">🔔</span>
@@ -1180,10 +1201,10 @@
                     </div>
                 </div>
                 <div class="req-item">
-                    <div class="req-icon">⬢</div>
+                    <div class="req-icon">🐍</div>
                     <div>
-                        <h4>Node.js</h4>
-                        <p>>= 18</p>
+                        <h4>Python + Node.js</h4>
+                        <p>Python >= 3.8 · Node >= 18</p>
                     </div>
                 </div>
                 <div class="req-item">
@@ -1200,22 +1221,22 @@
     <!-- Install -->
     <section class="install-section reveal" id="install">
         <div class="section-eyebrow" style="justify-content:center">get started</div>
-        <h2 class="section-title">Install in <span>one line.</span></h2>
-        <p class="section-sub" style="margin:16px auto 0;text-align:center">Works globally. No config needed.</p>
+        <h2 class="section-title">Install the <span>rewrite.</span></h2>
+        <p class="section-sub" style="margin:16px auto 0;text-align:center">Install from this fork; the unqualified npm package tracks the upstream project.</p>
 
         <div class="install-box">
-            <div class="install-cmd" onclick="navigator.clipboard.writeText('npm install -g remote-iterm'); this.querySelector('.copy-btn').textContent='COPIED!'">
+            <div class="install-cmd" onclick="navigator.clipboard.writeText('npm install -g github:alexspeller/remote-iterm'); this.querySelector('.copy-btn').textContent='COPIED!'">
                 <span class="prompt">$</span>
-                <code>npm install -g remote-iterm</code>
+                <code>npm install -g github:alexspeller/remote-iterm</code>
                 <span class="copy-btn">COPY</span>
             </div>
             <div class="install-note">Then just run <strong style="color:var(--accent2)">remote-iterm</strong> and scan the QR code</div>
             <div class="install-actions">
-                <a href="https://github.com/mammadovziya/remote-iterm" class="btn-secondary" target="_blank">
+                <a href="https://github.com/alexspeller/remote-iterm" class="btn-secondary" target="_blank">
                     GitHub →
                 </a>
-                <a href="https://www.npmjs.com/package/remote-iterm" class="btn-secondary" target="_blank">
-                    npm ↗
+                <a href="https://github.com/mammadovziya/remote-iterm" class="btn-secondary" target="_blank">
+                    Original ↗
                 </a>
             </div>
         </div>
@@ -1224,11 +1245,11 @@
     <!-- Footer -->
     <footer>
         <div class="footer-logo">remote<span>-iterm</span></div>
-        <div class="footer-copy">Built with ♥ by <a href="https://ziyamammadov.me" target="_blank">Ziya Mammadov</a></div>
+        <div class="footer-copy">Rewrite by <a href="https://github.com/alexspeller" target="_blank">Alex Speller</a> · based on <a href="https://github.com/mammadovziya/remote-iterm" target="_blank">Ziya Mammadov's original</a></div>
         <ul class="footer-links">
-            <li><a href="https://github.com/mammadovziya/remote-iterm" target="_blank">GitHub</a></li>
-            <li><a href="https://www.npmjs.com/package/remote-iterm" target="_blank">npm</a></li>
-            <li><a href="https://ziyamammadov.me" target="_blank">Portfolio</a></li>
+            <li><a href="https://github.com/alexspeller/remote-iterm" target="_blank">Fork</a></li>
+            <li><a href="https://github.com/mammadovziya/remote-iterm" target="_blank">Source</a></li>
+            <li><a href="https://github.com/alexspeller/remote-iterm/blob/main/docs/ARCHITECTURE.md" target="_blank">Architecture</a></li>
         </ul>
     </footer>
 
