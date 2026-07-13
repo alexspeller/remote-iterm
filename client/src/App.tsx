@@ -1293,7 +1293,10 @@ function VirtualKeyboard({ onKey, onExit }: { onKey: (key: string) => void; onEx
   return (
     <div className="flex flex-col gap-1.5">
       {rows.map((row, ri) => (
-        <div key={ri} className="flex w-full gap-1">
+        <div
+          key={ri}
+          className={`flex gap-1 ${ri === 0 ? 'w-full' : ri === 1 ? 'mx-[4%]' : 'mx-[10%]'}`}
+        >
           {row.map((ch, ci) => (
             <button
               key={`${ri}-${ci}`}
