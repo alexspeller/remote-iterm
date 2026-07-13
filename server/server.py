@@ -324,8 +324,8 @@ def _resolve(color, pal) -> str | None:
     return None  # alternate / default
 
 
-def _line_runs(line, pal) -> list:
-    """Group a LineContents into run-length colored runs: {t, f?, g?, b?}."""
+def _line_runs(line, pal, cursor_x: int | None = None) -> list:
+    """Group a line into styled runs, optionally marking its cursor cell."""
     runs: list = []
     cur = None
     buf = ""
@@ -334,12 +334,19 @@ def _line_runs(line, pal) -> list:
         style = line.style_at(x)
         if style is None:
             break
+        if cursor_x == x:
+            if buf:
+                runs.append(_make_run(cur, buf))
+                buf = ""
+            # The client renders this as a zero-width overlay, so the cursor
+            # does not move the character underneath it.
+            runs.append({"t": "", "c": True})
         ch = line.string_at(x).replace("\x00", " ")
         fg = _resolve(style.fg_color, pal)
         bg = _resolve(style.bg_color, pal)
         if style.inverse:
             fg, bg = (bg or pal["bg"]), (fg or pal["fg"])
-        key = (fg, bg, bool(style.bold))
+        key = (fg, bg, bool(style.bold), bool(style.faint))
         if key != cur:
             if buf:
                 runs.append(_make_run(cur, buf))
@@ -349,16 +356,22 @@ def _line_runs(line, pal) -> list:
         x += 1
     if buf:
         runs.append(_make_run(cur, buf))
+    if cursor_x is not None and cursor_x >= x:
+        if cursor_x > x:
+            runs.append({"t": " " * (cursor_x - x)})
+        runs.append({"t": "", "c": True})
     # Trim trailing whitespace runs that carry no background.
-    while runs and "g" not in runs[-1] and not runs[-1]["t"].strip():
+    # Never trim through the cursor: it may be on an otherwise blank line.
+    while (runs and not runs[-1].get("c") and "g" not in runs[-1]
+           and not runs[-1]["t"].strip()):
         runs.pop()
-    if runs and "g" not in runs[-1]:
+    if runs and not runs[-1].get("c") and "g" not in runs[-1]:
         runs[-1]["t"] = runs[-1]["t"].rstrip()
     return runs
 
 
 def _make_run(key, text: str) -> dict:
-    fg, bg, bold = key
+    fg, bg, bold, dim = key
     run = {"t": text}
     if fg:
         run["f"] = fg
@@ -366,6 +379,8 @@ def _make_run(key, text: str) -> dict:
         run["g"] = bg
     if bold:
         run["b"] = True
+    if dim:
+        run["d"] = True
     return run
 
 
@@ -379,6 +394,7 @@ async def read_content(session_id: str | None) -> dict | None:
         pal = await get_palette(session)
         async with iterm2.Transaction(connection):
             info = await session.async_get_line_info()
+            screen = await session.async_get_screen_contents()
             total = (info.overflow + info.scrollback_buffer_height
                      + info.mutable_area_height)
             first = max(info.overflow, total - CONTENT_LINES)
@@ -386,7 +402,11 @@ async def read_content(session_id: str | None) -> dict | None:
             if count <= 0:
                 return {"lines": [], "fg": pal["fg"], "bg": pal["bg"]}
             lines = await session.async_get_contents(first, count)
-        rendered = [_line_runs(line, pal) for line in lines]
+        cursor = screen.cursor_coord
+        rendered = [
+            _line_runs(line, pal, cursor.x if first + i == cursor.y else None)
+            for i, line in enumerate(lines)
+        ]
         while rendered and not rendered[-1]:
             rendered.pop()
         return {"lines": rendered, "fg": pal["fg"], "bg": pal["bg"]}

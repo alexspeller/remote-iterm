@@ -10,9 +10,9 @@ interface Bounds { x: number; y: number; w: number; h: number; }
 interface WindowState { id: string; isFront: boolean; tabs: Tab[]; bounds?: Bounds; }
 interface ScreenSize { width: number; height: number; }
 
-// A run of text sharing one style: t=text, f=fg hex, g=bg hex, b=bold.
+// A run of text sharing one style: t=text, f=fg hex, g=bg hex, b=bold, d=dim.
 // f/g omitted means "use the pane default" (theme fg/bg).
-interface Run { t: string; f?: string; g?: string; b?: boolean }
+interface Run { t: string; f?: string; g?: string; b?: boolean; d?: boolean; c?: boolean }
 interface StyledContent { lines: Run[][]; fg: string; bg: string }
 
 const ACCENT = '#10b981';
@@ -926,14 +926,19 @@ export default function App() {
                 {content.lines.map((runs, i) => (
                   <span key={i}>
                     {runs.map((r, j) => (
-                      <span key={j} style={{ color: r.f, fontWeight: r.b ? 600 : 400, ...(r.g ? { backgroundColor: r.g } : null) }}>
-                        {r.t}
-                      </span>
+                      r.c ? (
+                        focusedPane === 'primary' && (
+                          <span key={j} className="cursor-blink cursor-cell" style={{ color: ACCENT }} aria-hidden="true">█</span>
+                        )
+                      ) : (
+                        <span key={j} style={{ color: r.f, fontWeight: r.b ? 600 : 400, opacity: r.d ? 0.55 : 1, ...(r.g ? { backgroundColor: r.g } : null) }}>
+                          {r.t}
+                        </span>
+                      )
                     ))}
                     {i < content.lines.length - 1 ? '\n' : ''}
                   </span>
                 ))}
-                {focusedPane === 'primary' && <span className="cursor-blink" style={{ color: ACCENT }}>█</span>}
               </pre>
             ) : (
               <div className="flex flex-col items-center justify-center h-full gap-3">
@@ -1032,14 +1037,19 @@ export default function App() {
                   {splitContent.lines.map((runs, i) => (
                     <span key={i}>
                       {runs.map((r, j) => (
-                        <span key={j} style={{ color: r.f, fontWeight: r.b ? 600 : 400, ...(r.g ? { backgroundColor: r.g } : null) }}>
-                          {r.t}
-                        </span>
+                        r.c ? (
+                          focusedPane === 'split' && (
+                            <span key={j} className="cursor-blink cursor-cell" style={{ color: '#38bdf8' }} aria-hidden="true">█</span>
+                          )
+                        ) : (
+                          <span key={j} style={{ color: r.f, fontWeight: r.b ? 600 : 400, opacity: r.d ? 0.55 : 1, ...(r.g ? { backgroundColor: r.g } : null) }}>
+                            {r.t}
+                          </span>
+                        )
                       ))}
                       {i < splitContent.lines.length - 1 ? '\n' : ''}
                     </span>
                   ))}
-                  {focusedPane === 'split' && <span className="cursor-blink" style={{ color: '#38bdf8' }}>█</span>}
                 </pre>
               ) : (
                 <div className="flex flex-col items-center justify-center h-full gap-3">
@@ -1138,6 +1148,7 @@ export default function App() {
           .pr-safe { padding-right: max(0px, env(safe-area-inset-right)); }
         }
         .cursor-blink { animation: blink 1s step-end infinite; }
+        .cursor-cell { display: inline-block; position: relative; width: 0; z-index: 1; }
         @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
         .no-scrollbar::-webkit-scrollbar { display: none; }
         ::-webkit-scrollbar { width: 3px; }
@@ -1163,7 +1174,7 @@ const PanePreview = memo(function PanePreview({ content }: { content?: StyledCon
           <div key={i}>
             {runs.length
               ? runs.map((r, j) => (
-                  <span key={j} style={{ color: r.f, fontWeight: r.b ? 600 : 400, ...(r.g ? { backgroundColor: r.g } : null) }}>
+                  <span key={j} style={{ color: r.f, fontWeight: r.b ? 600 : 400, opacity: r.d ? 0.55 : 1, ...(r.g ? { backgroundColor: r.g } : null) }}>
                     {r.t}
                   </span>
                 ))
@@ -1282,48 +1293,39 @@ function VirtualKeyboard({ onKey, onExit }: { onKey: (key: string) => void; onEx
   return (
     <div className="flex flex-col gap-1.5">
       {rows.map((row, ri) => (
-        <div key={ri} className="flex justify-center gap-1">
-          {ri === 2 && mode === 'abc' && (
-            <button
-              onClick={() => setShift(!shift)}
-              className="flex items-center justify-center h-[38px] px-3 rounded-md border text-[11px] font-bold transition-all active:scale-90"
-              style={{
-                borderColor: shift ? ACCENT : '#3f3f46',
-                backgroundColor: shift ? ACCENT + '25' : '#27272a',
-                color: shift ? ACCENT : '#a1a1aa',
-              }}
-            >
-              SHIFT
-            </button>
-          )}
-          {ri === 2 && mode !== 'abc' && (
-            <button
-              onClick={() => setMode(mode === 'sym' ? 'sym2' : 'sym')}
-              className="flex items-center justify-center h-[38px] px-2.5 rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[10px] font-bold text-zinc-400 transition-all active:scale-90"
-            >
-              {mode === 'sym' ? '#+=' : '123'}
-            </button>
-          )}
+        <div key={ri} className="flex w-full gap-1">
           {row.map((ch, ci) => (
             <button
               key={`${ri}-${ci}`}
               onClick={() => send(ch)}
-              className="flex items-center justify-center w-[30px] h-[38px] rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[13px] font-semibold text-zinc-200 transition-all active:scale-90 active:bg-zinc-700"
+              className="flex min-w-0 flex-1 items-center justify-center h-[42px] rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[14px] font-semibold text-zinc-200 transition-all active:scale-90 active:bg-zinc-700"
             >
               {mode === 'abc' && shift ? ch.toUpperCase() : ch}
             </button>
           ))}
-          {ri === 2 && (
-            <button
-              onClick={() => onKey('\x7f')}
-              className="flex items-center justify-center h-[38px] px-3 rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[11px] font-bold text-zinc-400 transition-all active:scale-90 active:bg-zinc-700"
-            >
-              DEL
-            </button>
-          )}
         </div>
       ))}
-      <div className="flex justify-center gap-1">
+      <div className="flex w-full gap-1">
+        {mode === 'abc' ? (
+          <button
+            onClick={() => setShift(!shift)}
+            className="flex basis-[18%] items-center justify-center h-[38px] rounded-md border text-[11px] font-bold transition-all active:scale-90"
+            style={{
+              borderColor: shift ? ACCENT : '#3f3f46',
+              backgroundColor: shift ? ACCENT + '25' : '#27272a',
+              color: shift ? ACCENT : '#a1a1aa',
+            }}
+          >
+            SHIFT
+          </button>
+        ) : (
+          <button
+            onClick={() => setMode(mode === 'sym' ? 'sym2' : 'sym')}
+            className="flex basis-[18%] items-center justify-center h-[38px] rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[10px] font-bold text-zinc-400 transition-all active:scale-90"
+          >
+            {mode === 'sym' ? '#+=' : '123'}
+          </button>
+        )}
         {KB_ARROWS.map(({ seq, Icon, label }) => (
           <button
             key={label}
@@ -1335,6 +1337,12 @@ function VirtualKeyboard({ onKey, onExit }: { onKey: (key: string) => void; onEx
             <Icon className="w-4 h-4" />
           </button>
         ))}
+        <button
+          onClick={() => onKey('\x7f')}
+          className="flex basis-[18%] items-center justify-center h-[38px] rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[11px] font-bold text-zinc-400 transition-all active:scale-90 active:bg-zinc-700"
+        >
+          DEL
+        </button>
       </div>
       <div className="flex justify-center gap-1">
         <button
