@@ -39,7 +39,7 @@ The backend runs `python-socketio` on `aiohttp` alongside one iTerm2 API connect
 - Reconstruct nested split-pane rectangles by walking iTerm2's splitter tree.
 - Subscribe to layout and focus notifications.
 - Run one screen-stream task per session watched by at least one connected client.
-- Read a bounded 120-line terminal snapshot and encode it as compact styled runs.
+- Read all scrollback retained by each iTerm session plus its current screen, and encode it as compact styled runs.
 - Resolve terminal colors through the session's profile and the xterm 256-color palette.
 - Route commands and raw key bytes to a specific session.
 
@@ -53,6 +53,7 @@ The Vite/React client maintains the selected window, tab, and session separately
 
 - Automatically follows focus changes made on the Mac while preserving explicit pane selection.
 - Caches styled output by session for fast switching and pane thumbnails.
+- Follows live output only while a pane is already scrolled to the bottom, preserving the reader's position when they scroll back.
 - Tells the backend exactly which primary and secondary sessions need live updates.
 - Renders a tab's real split geometry as a spatial picker.
 - Sends all input to the currently focused mobile pane.

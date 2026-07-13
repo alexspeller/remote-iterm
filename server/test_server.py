@@ -1,6 +1,6 @@
 import unittest
 
-from server.server import _DEFAULT_PALETTE, _line_runs
+from server.server import _DEFAULT_PALETTE, _available_line_range, _line_runs
 
 
 class _DefaultColor:
@@ -48,6 +48,16 @@ class LineRunsTest(unittest.TestCase):
             _line_runs(_Line("ab", faint_at={1}), _DEFAULT_PALETTE),
             [{"t": "a"}, {"t": "b", "d": True}],
         )
+
+
+class AvailableLineRangeTest(unittest.TestCase):
+    def test_includes_all_retained_scrollback_and_screen_lines(self):
+        class Info:
+            overflow = 275
+            scrollback_buffer_height = 10_000
+            mutable_area_height = 40
+
+        self.assertEqual(_available_line_range(Info()), (275, 10_040))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useMemo, memo } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useMemo, memo } from 'react';
 import { io, Socket } from 'socket.io-client';
 import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, LayoutGrid } from 'lucide-react';
 
@@ -25,6 +25,11 @@ const SOCKET_URL = window.location.hostname === 'localhost'
 
 const HISTORY_KEY = 'iterm-cmd-history';
 const MAX_HISTORY = 100;
+const BOTTOM_THRESHOLD_PX = 4;
+
+function isScrolledToBottom(element: HTMLDivElement): boolean {
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_THRESHOLD_PX;
+}
 
 function loadHistory(): string[] {
   try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || '[]'); } catch { return []; }
@@ -72,6 +77,8 @@ export default function App() {
   const socketRef = useRef<Socket | null>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const splitContentRef = useRef<HTMLDivElement>(null);
+  const primaryAtBottomRef = useRef(true);
+  const splitAtBottomRef = useRef(true);
   const splitContainerRef = useRef<HTMLDivElement>(null);
   const stateRef = useRef(state);
   const winIdRef = useRef(selectedWinId);
@@ -248,15 +255,30 @@ export default function App() {
     s.emit('watch', { sessionIds: ids });
   }, [connected, selectedSessionId, splitMode, splitSessionId]);
 
-  // Auto-scroll terminal to bottom (unless scroll-locked)
-  useEffect(() => {
-    if (!scrollLocked && contentRef.current) {
-      contentRef.current.scrollTop = contentRef.current.scrollHeight;
+  // A newly selected pane starts at its latest output. Thereafter, follow new
+  // output only while that pane is already at the bottom, so scrolling up is
+  // not undone by a live content update.
+  useLayoutEffect(() => {
+    primaryAtBottomRef.current = true;
+  }, [selectedSessionId]);
+
+  useLayoutEffect(() => {
+    splitAtBottomRef.current = true;
+  }, [splitSessionId]);
+
+  useLayoutEffect(() => {
+    const element = contentRef.current;
+    if (!scrollLocked && primaryAtBottomRef.current && element) {
+      element.scrollTop = element.scrollHeight;
     }
-    if (!scrollLocked && splitContentRef.current) {
-      splitContentRef.current.scrollTop = splitContentRef.current.scrollHeight;
+  }, [content, scrollLocked]);
+
+  useLayoutEffect(() => {
+    const element = splitContentRef.current;
+    if (!scrollLocked && splitAtBottomRef.current && element) {
+      element.scrollTop = element.scrollHeight;
     }
-  }, [content, splitContent, scrollLocked]);
+  }, [splitContent, scrollLocked]);
 
   // Long-running command alert: if content was changing and stops for 4s, vibrate
   useEffect(() => {
@@ -920,7 +942,13 @@ export default function App() {
               onOpenMap={handleOpenPaneMap}
             />
           )}
-          <div ref={contentRef} className="flex-1 overflow-auto relative min-h-0 min-w-0">
+          <div
+            ref={contentRef}
+            onScroll={(event) => {
+              primaryAtBottomRef.current = isScrolledToBottom(event.currentTarget);
+            }}
+            className="flex-1 overflow-auto relative min-h-0 min-w-0"
+          >
             {content && content.lines.length ? (
               <pre className="p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full" style={{ color: content.fg, backgroundColor: content.bg }}>
                 {content.lines.map((runs, i) => (
@@ -1029,6 +1057,9 @@ export default function App() {
             </div>
             <div
               ref={splitContentRef}
+              onScroll={(event) => {
+                splitAtBottomRef.current = isScrolledToBottom(event.currentTarget);
+              }}
               className="flex-1 overflow-auto relative min-h-0 min-w-0"
               style={{ borderLeft: `3px solid ${focusedPane === 'split' ? '#38bdf8' : '#38bdf830'}` }}
             >

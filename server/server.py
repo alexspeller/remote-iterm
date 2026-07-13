@@ -25,10 +25,6 @@ except Exception:  # pragma: no cover - pyobjc should always be present
 
 PORT = 7291
 
-# Lines of recent output (including scrollback) sent per session. The API makes
-# this cheap, so we send a comfortable chunk and let the client scroll.
-CONTENT_LINES = 120
-
 sio = socketio.AsyncServer(async_mode="aiohttp", cors_allowed_origins="*")
 app = web.Application()
 sio.attach(app)
@@ -385,6 +381,19 @@ def _make_run(key, text: str) -> dict:
     return run
 
 
+def _available_line_range(info) -> tuple[int, int]:
+    """Return the complete range still retained by the iTerm session.
+
+    Absolute line numbers below ``overflow`` have already been discarded by
+    iTerm. Everything after it consists of the session's scrollback plus its
+    mutable screen area and is available through ``async_get_contents``.
+    """
+    return (
+        info.overflow,
+        info.scrollback_buffer_height + info.mutable_area_height,
+    )
+
+
 async def read_content(session_id: str | None) -> dict | None:
     if itermapp is None or not session_id or session_id == "undefined":
         return None
@@ -396,10 +405,7 @@ async def read_content(session_id: str | None) -> dict | None:
         async with iterm2.Transaction(connection):
             info = await session.async_get_line_info()
             screen = await session.async_get_screen_contents()
-            total = (info.overflow + info.scrollback_buffer_height
-                     + info.mutable_area_height)
-            first = max(info.overflow, total - CONTENT_LINES)
-            count = total - first
+            first, count = _available_line_range(info)
             if count <= 0:
                 return {"lines": [], "fg": pal["fg"], "bg": pal["bg"]}
             lines = await session.async_get_contents(first, count)
