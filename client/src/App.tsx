@@ -1,6 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, memo } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, LayoutGrid, List as ListIcon } from 'lucide-react';
+import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, LayoutGrid, List as ListIcon, KeyRound } from 'lucide-react';
 
 // --- Types ---
 interface PaneRect { x: number; y: number; w: number; h: number; }
@@ -32,11 +32,27 @@ const SOCKET_URL = window.location.hostname === 'localhost'
   : `http://${window.location.hostname}:7291`;
 
 const HISTORY_KEY = 'iterm-cmd-history';
+const ACCESS_KEY_STORAGE_KEY = 'remote-iterm-access-key';
 const MAX_HISTORY = 100;
 const BOTTOM_THRESHOLD_PX = 4;
 
 function isScrolledToBottom(element: HTMLDivElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_THRESHOLD_PX;
+}
+
+function loadAccessKey(): string {
+  const fragmentKey = new URLSearchParams(window.location.hash.slice(1)).get('key')?.trim();
+  if (fragmentKey) {
+    try { localStorage.setItem(ACCESS_KEY_STORAGE_KEY, fragmentKey); } catch {}
+    return fragmentKey;
+  }
+  try { return localStorage.getItem(ACCESS_KEY_STORAGE_KEY)?.trim() || ''; } catch { return ''; }
+}
+
+function rememberAccessKey(key: string) {
+  try { localStorage.setItem(ACCESS_KEY_STORAGE_KEY, key); } catch {}
+  const hash = new URLSearchParams({ key }).toString();
+  window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${hash}`);
 }
 
 function mergeStyledContent(current: StyledContent | undefined, incoming: StyledContent): StyledContent {
@@ -99,6 +115,9 @@ function tabDefaultSession(tab?: Tab): string | undefined {
 
 export default function App() {
   const [connected, setConnected] = useState(false);
+  const [accessKey, setAccessKey] = useState(loadAccessKey);
+  const [accessKeyInput, setAccessKeyInput] = useState('');
+  const [authError, setAuthError] = useState(false);
   const [state, setState] = useState<WindowState[]>([]);
   const [screenSize, setScreenSize] = useState<ScreenSize | null>(null);
   const [content, setContent] = useState<StyledContent | null>(null);
@@ -167,7 +186,14 @@ export default function App() {
 
   // --- Socket init ---
   useEffect(() => {
+    setConnected(false);
+    if (!accessKey) {
+      socketRef.current = null;
+      return;
+    }
+
     const s = io(SOCKET_URL, {
+      auth: { key: accessKey },
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
@@ -176,8 +202,18 @@ export default function App() {
     });
     socketRef.current = s;
 
-    s.on('connect', () => setConnected(true));
+    s.on('connect', () => {
+      setAuthError(false);
+      setConnected(true);
+    });
     s.on('disconnect', () => setConnected(false));
+    s.on('connect_error', (error) => {
+      setConnected(false);
+      if (error.message === 'invalid access key') {
+        setAuthError(true);
+        s.disconnect();
+      }
+    });
 
     // Measure latency every 5s (+ immediately on connect)
     let pingInterval: ReturnType<typeof setInterval>;
@@ -286,7 +322,7 @@ export default function App() {
     });
 
     return () => { s.disconnect(); };
-  }, []);
+  }, [accessKey]);
 
   // Keep screen awake
   useEffect(() => {
@@ -641,11 +677,67 @@ export default function App() {
     }))).filter(s => s.sessionId && s.sessionId !== activeSid);
   }, [state, activeWindow, selectedTabId]);
 
+  const handleAccessKeySubmit = (event: React.FormEvent) => {
+    event.preventDefault();
+    const key = accessKeyInput.trim();
+    if (!key) return;
+    try { rememberAccessKey(key); } catch {}
+    setState([]);
+    setContent(null);
+    setSplitContent(null);
+    contentCacheRef.current.clear();
+    setAuthError(false);
+    setAccessKeyInput('');
+    setAccessKey(key);
+  };
+
   return (
     <div className="flex flex-col bg-[#0a0a0a] font-mono overflow-hidden select-none relative pt-safe pb-safe-root pl-safe pr-safe" style={{ height: '100dvh' }}>
 
+      {/* ── Access Key Overlay ── */}
+      {(!accessKey || authError) && (
+        <div
+          className="fixed inset-0 z-[110] flex items-center justify-center px-5"
+          style={{ backgroundColor: 'rgba(0,0,0,0.94)', backdropFilter: 'blur(10px)', WebkitBackdropFilter: 'blur(10px)' }}
+        >
+          <form
+            onSubmit={handleAccessKeySubmit}
+            className="w-full max-w-sm rounded-xl border border-zinc-800 bg-[#111113] p-5 shadow-2xl"
+          >
+            <div className="mb-4 flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-emerald-500/30 bg-emerald-500/10">
+                <KeyRound className="h-5 w-5 text-emerald-400" />
+              </div>
+              <div>
+                <div className="text-[12px] font-bold tracking-[0.14em] text-zinc-200">ACCESS KEY REQUIRED</div>
+                <div className="mt-1 text-[10px] text-zinc-600">
+                  {authError ? 'That key was not accepted.' : 'Scan the server QR code or enter its key.'}
+                </div>
+              </div>
+            </div>
+            <input
+              type="password"
+              value={accessKeyInput}
+              onChange={(event) => setAccessKeyInput(event.target.value)}
+              placeholder="Shared access key"
+              autoComplete="off"
+              autoCapitalize="none"
+              spellCheck={false}
+              className="h-12 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 text-[12px] text-zinc-200 outline-none placeholder:text-zinc-700 focus:border-emerald-500/60"
+            />
+            <button
+              type="submit"
+              disabled={!accessKeyInput.trim()}
+              className="mt-3 h-11 w-full rounded-lg bg-emerald-500 text-[11px] font-bold tracking-[0.14em] text-black disabled:bg-zinc-800 disabled:text-zinc-600"
+            >
+              CONNECT
+            </button>
+          </form>
+        </div>
+      )}
+
       {/* ── Reconnect Overlay ── */}
-      {!connected && (
+      {accessKey && !authError && !connected && (
         <div
           className="fixed inset-0 z-[100] flex flex-col items-center justify-center gap-3"
           style={{ backgroundColor: 'rgba(0,0,0,0.9)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)' }}

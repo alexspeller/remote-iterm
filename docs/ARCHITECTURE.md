@@ -27,9 +27,10 @@ The shell launcher owns the local process lifecycle:
 1. Finds a working Python 3.8 or newer rather than accepting the macOS Command Line Tools shim.
 2. Creates `server/.venv` on first use.
 3. Hashes `server/requirements.txt` and installs dependencies only when that hash changes.
-4. Starts the Python service on port 7291 and Vite on port 7292.
-5. Stores both process IDs, prints a QR code, and exposes `start`, `stop`, and `restart` commands.
-6. On stop, checks the listening ports as well as the PID file, making cleanup resilient to stale or reparented processes.
+4. Creates a 256-bit shared key on first launch and reuses it from `~/Library/Application Support/remote-iterm/access-key`.
+5. Starts the Python service on port 7291 and Vite on port 7292.
+6. Stores both process IDs, prints a key-bearing QR code, and exposes `start`, `stop`, and `restart` commands.
+7. On stop, checks the listening ports as well as the PID file, making cleanup resilient to stale or reparented processes.
 
 ### Python service (`server/server.py`)
 
@@ -61,6 +62,7 @@ The Vite/React client maintains the selected window, tab, and session separately
 - Sends all input to the currently focused mobile pane.
 - Stores command history only in browser `localStorage`.
 - Reconnects indefinitely and measures Socket.IO round-trip latency.
+- Reads the shared key from the URL fragment, remembers it in browser `localStorage`, and sends it in the Socket.IO authentication payload.
 
 The client is an installable PWA, but it is still a web application served by the Mac. There is no cloud relay or hosted control plane.
 
@@ -104,9 +106,9 @@ The service writes directly to the target iTerm2 session:
 
 ## Trust and security model
 
-The backend listens on all interfaces and allows any Socket.IO origin. There is currently no authentication, authorization, TLS, command confirmation, or read-only mode. This is intentional for frictionless use on a trusted LAN, but it means network reachability grants terminal control.
+The backend listens on all interfaces and allows any Socket.IO origin, but rejects the Socket.IO namespace connection unless its authentication payload contains the generated shared key. Rejection happens before window state or terminal content is emitted. The key is stored in a user-only file on the Mac and in browser `localStorage`; QR and bookmark URLs carry it in the fragment, which browsers do not include in the initial HTTP request.
 
-Do not expose ports 7291 or 7292 to the public internet. Avoid untrusted or shared networks, do not configure router port forwarding, and stop the service when it is not in use. Authentication and encrypted transport should be treated as prerequisites before adding any remote relay or internet-facing deployment.
+This is bearer-key authentication, not encrypted transport. The subsequent Socket.IO authentication payload and terminal traffic travel over plain HTTP/WebSocket, so a capable network observer can capture them and reuse the key. There is also no per-client authorization, command confirmation, or read-only mode. Do not expose ports 7291 or 7292 to the public internet; prefer a trusted LAN or VPN and treat TLS as a prerequisite before any remote relay or internet-facing deployment.
 
 ## Testing boundaries
 

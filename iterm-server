@@ -57,12 +57,14 @@ ensure_venv() {
 }
 
 do_start() {
+  local shared_key
   if lsof -nP -tiTCP:7291 -sTCP:LISTEN >/dev/null 2>&1; then
     echo "  Already running"
     return 1
   fi
 
   ensure_venv || return 1
+  shared_key="$("$VENV/bin/python" "$DIR/server/auth.py")" || return 1
 
   # exec in the subshell so $! is the real daemon pid (not the subshell wrapper),
   # which keeps the pidfile accurate for `stop`.
@@ -75,7 +77,7 @@ do_start() {
   echo "$SERVER_PID $CLIENT_PID" > "$PIDFILE"
 
   IP=$(get_local_ip)
-  URL="http://${IP}:7292"
+  URL="http://${IP}:7292/#key=${shared_key}"
   "$VENV/bin/python" - "$URL" <<'PYQR'
 import sys
 
@@ -92,7 +94,7 @@ except Exception:
 print()
 print("  Remote iTerm")
 print()
-print("  Local:    http://localhost:7292")
+print(f"  Local:    http://localhost:7292/#key={url.rsplit('#key=', 1)[1]}")
 print(f"  Network:  {url}")
 print()
 print("  Scan the QR from your phone (same Wi-Fi)")

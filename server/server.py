@@ -19,6 +19,11 @@ import socketio
 from aiohttp import web
 
 try:
+    from .auth import is_valid_key, load_or_create_key
+except ImportError:  # Running server.py directly from the server directory.
+    from auth import is_valid_key, load_or_create_key
+
+try:
     from AppKit import NSScreen
 except Exception:  # pragma: no cover - pyobjc should always be present
     NSScreen = None
@@ -40,6 +45,7 @@ clients: set[str] = set()
 
 connection: iterm2.Connection | None = None
 itermapp: iterm2.App | None = None
+shared_key: str | None = None
 
 screen_size = {"width": 1470, "height": 956}
 
@@ -556,6 +562,10 @@ async def focus_monitor() -> None:
 
 @sio.event
 async def connect(sid, environ, auth=None):
+    supplied_key = auth.get("key") if isinstance(auth, dict) else None
+    if not is_valid_key(shared_key, supplied_key):
+        print(f"Rejected unauthenticated client: {sid}")
+        raise socketio.exceptions.ConnectionRefusedError("invalid access key")
     clients.add(sid)
     print(f"Client connected: {sid}")
     await sio.emit("screenSize", screen_size, to=sid)
@@ -711,9 +721,11 @@ async def on_focus(sid, data):
 # --- Entry point ---------------------------------------------------------------
 
 async def main() -> None:
-    global connection, itermapp, screen_size
+    global connection, itermapp, screen_size, shared_key
     screen_size = read_screen_size()
     print("Screen size:", screen_size)
+
+    shared_key = load_or_create_key()
 
     connection = await iterm2.Connection.async_create()
     itermapp = await iterm2.async_get_app(connection)

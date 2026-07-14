@@ -35,7 +35,7 @@ The launcher prints local and network URLs and a QR code. Open the network URL o
 On first launch, iTerm2 asks for one-time Automation permission so the Python API can connect. Approve it when prompted.
 
 > [!WARNING]
-> remote-iterm has no authentication or transport encryption. Anyone who can reach the service on your network can view terminal output and send input. Use it only on a trusted local network, and stop it when you are finished.
+> remote-iterm protects terminal access with a machine-stable shared key generated on first launch. It still uses unencrypted HTTP and WebSocket traffic: a network observer could capture the key and terminal data. Prefer a trusted local network or VPN, never forward its ports to the internet, and stop it when you are finished.
 
 ## What changed in this fork
 
@@ -72,6 +72,7 @@ For the component model, data flow, Socket.IO contract, and design trade-offs, s
 ## Features
 
 - Live terminal output with profile-aware ANSI and true-color rendering
+- Machine-stable shared-key authentication through QR and bookmarked URLs
 - Visible cursor, bold, faint, inverse, and background styles
 - Tab creation, closing, selection, and long-press rename
 - Horizontal tab strips with a touch-friendly vertical tab picker
@@ -105,7 +106,7 @@ npm install
 ./iterm-server
 ```
 
-The first launch creates `server/.venv` and installs the Python dependencies. Later launches reinstall them only when `server/requirements.txt` changes.
+The first launch creates `server/.venv`, installs the Python dependencies, and generates a private shared access key. The QR code and printed URLs include that key in the URL fragment, so the page can be bookmarked without sending the key in the initial HTTP request. Later launches reuse the same key and reinstall dependencies only when `server/requirements.txt` changes.
 
 ## Development and tests
 
@@ -128,6 +129,7 @@ The backend requires a running iTerm2 instance and permission to use its Python 
 - `.iterm-server.pid` — backend and client process IDs
 - `.iterm-server.log` — combined server and client log
 - `server/.venv` — automatically managed Python environment
+- `~/Library/Application Support/remote-iterm/access-key` — generated shared key (`0600` permissions)
 
 ## Project lineage
 
