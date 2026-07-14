@@ -62,6 +62,10 @@ do_start() {
     echo "  Already running"
     return 1
   fi
+  if lsof -nP -tiTCP:7292 -sTCP:LISTEN >/dev/null 2>&1; then
+    echo "  Client port 7292 is already in use"
+    return 1
+  fi
 
   ensure_venv || return 1
   shared_key="$("$VENV/bin/python" "$DIR/server/auth.py")" || return 1
@@ -71,7 +75,7 @@ do_start() {
   ( cd "$DIR/server" && exec "$VENV/bin/python" -u server.py >> "$LOGFILE" 2>&1 ) &
   SERVER_PID=$!
 
-  ( cd "$DIR/client" && exec npx vite --host --port 7292 >> "$LOGFILE" 2>&1 ) &
+  ( cd "$DIR/client" && exec npx vite --host --port 7292 --strictPort >> "$LOGFILE" 2>&1 ) &
   CLIENT_PID=$!
 
   echo "$SERVER_PID $CLIENT_PID" > "$PIDFILE"
@@ -124,6 +128,20 @@ do_stop() {
     done
     rm -f "$PIDFILE"
   fi
+
+  # Do not let `restart` race processes that have received SIGTERM but have not
+  # released their listening sockets yet.
+  for _ in {1..20}; do
+    listening=0
+    for port in 7291 7292; do
+      for pid in $(lsof -nP -tiTCP:$port -sTCP:LISTEN 2>/dev/null); do
+        listening=1
+        kill "$pid" 2>/dev/null && killed=1
+      done
+    done
+    [ "$listening" = "0" ] && break
+    sleep 0.1
+  done
 
   if [ "$killed" = "1" ]; then
     echo "  Stopped"

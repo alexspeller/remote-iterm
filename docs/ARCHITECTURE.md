@@ -30,7 +30,8 @@ The shell launcher owns the local process lifecycle:
 4. Creates a 256-bit shared key on first launch and reuses it from `~/Library/Application Support/remote-iterm/access-key`.
 5. Starts the Python service on port 7291 and Vite on port 7292.
 6. Stores both process IDs, prints a key-bearing QR code, and exposes `start`, `stop`, and `restart` commands.
-7. On stop, checks the listening ports as well as the PID file, making cleanup resilient to stale or reparented processes.
+7. Refuses Vite's fallback-port behavior, and on stop waits for both fixed ports to be released before a restart.
+8. Runs the Python service without initializing AppKit, so it remains a background process instead of appearing in the macOS application switcher.
 
 ### Python service (`server/server.py`)
 
@@ -48,6 +49,10 @@ The backend runs `python-socketio` on `aiohttp` alongside one iTerm2 API connect
 State changes are pushed when iTerm2 reports them. A two-second synchronization loop covers job-title changes and pure window moves that do not have a suitable notification; serialized state is compared with the last value before anything is emitted.
 
 Screen streaming is based on the union of every client's `watch` list. This means two phones watching the same pane share one backend stream task, while an unwatched background pane consumes no continuous screen-reading work. Each live update contains only the most recent 250 lines; pane-map previews request 40 lines, and older history loads in 500-line pages. This prevents large or unlimited iTerm histories from being read and retransmitted on every screen change while still making all retained scrollback reachable.
+
+Terminal changes are coalesced to at most 20 snapshots per second per watched session. Each connected client has a latest-wins application outbox: a newer live snapshot replaces an undelivered one for the same pane. The delivery task also stops feeding Engine.IO while that socket's outbound queue is full. Consequently a sleeping phone retains bounded work instead of growing an unbounded chain of serialized terminal screens. Live content is routed only to clients watching that session, and cancelled stream tasks are awaited before their references are discarded. A periodic health line records peak RSS, client and stream counts, pending events, and the largest transport queue for diagnosis.
+
+Display geometry is read directly from CoreGraphics. The server deliberately does not import AppKit or create an `NSApplication`, which keeps its Python process out of Cmd-Tab while preserving the screen dimensions needed for the spatial window map.
 
 ### React client (`client/`)
 
@@ -112,4 +117,4 @@ This is bearer-key authentication, not encrypted transport. The subsequent Socke
 
 ## Testing boundaries
 
-`server/test_server.py` covers pure styled-output behavior, including cursor placement and faint text. `npm --prefix client run build` type-checks and bundles the React client. The iTerm2 connection, macOS screen geometry, notifications, and end-to-end phone interaction still require manual integration testing against a running iTerm2 instance.
+`server/test_server.py` covers pure styled-output behavior, scrollback ranges, and latest-wins watcher routing. `npm --prefix client run build` type-checks and bundles the React client. The iTerm2 connection, macOS screen geometry, notifications, and end-to-end phone interaction still require manual integration testing against a running iTerm2 instance.

@@ -43,6 +43,7 @@ On first launch, iTerm2 asks for one-time Automation permission so the Python AP
 
 - Replaced the Node.js/Express and `osascript` backend with Python, `asyncio`, `aiohttp`, and the native iTerm2 Python API.
 - Replaced 150 ms content polling and repeated subprocess creation with iTerm2 screen streams for the sessions clients are actually watching.
+- Coalesces fast output and uses bounded, latest-wins delivery per phone, so a sleeping or slow client cannot accumulate an unlimited terminal-output backlog.
 - Uses iTerm2 layout and focus notifications for responsive state updates, with a deduplicated low-frequency refresh only for changes the API does not notify about.
 - Uses stable iTerm2 session GUIDs and addresses panes directly, including panes that are not focused on the Mac.
 
@@ -64,14 +65,16 @@ On first launch, iTerm2 asks for one-time Automation permission so the Python AP
 
 - Creates and updates an isolated Python virtual environment automatically.
 - Tracks both the backend and Vite processes and can recover from stale PID files by checking the listening ports.
+- Runs Python as a background-only process on macOS and refuses to silently start Vite on an unexpected fallback port.
 - Starts with a scannable QR code and keeps the existing `start`, `stop`, and `restart` CLI workflow.
-- Adds focused unit coverage for styled output and cursor placement.
+- Adds focused unit coverage for styled output, cursor placement, scrollback paging, and bounded client delivery.
 
 For the component model, data flow, Socket.IO contract, and design trade-offs, see [Architecture](docs/ARCHITECTURE.md).
 
 ## Features
 
 - Live terminal output with profile-aware ANSI and true-color rendering
+- Bounded live delivery that remains safe when a phone sleeps or its connection stalls
 - Machine-stable shared-key authentication through QR and bookmarked URLs
 - Visible cursor, bold, faint, inverse, and background styles
 - Tab creation, closing, selection, and long-press rename

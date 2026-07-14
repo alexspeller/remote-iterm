@@ -10,9 +10,12 @@ adding pane watches and structured, styled terminal content for the rewritten
 client.
 """
 import asyncio
+import ctypes
 import json
 import math
+import resource
 import signal
+import sys
 
 import iterm2
 import socketio
@@ -23,11 +26,6 @@ try:
 except ImportError:  # Running server.py directly from the server directory.
     from auth import is_valid_key, load_or_create_key
 
-try:
-    from AppKit import NSScreen
-except Exception:  # pragma: no cover - pyobjc should always be present
-    NSScreen = None
-
 PORT = 7291
 
 # Watched panes receive only their recent tail on each screen change. Older
@@ -36,6 +34,9 @@ PORT = 7291
 LIVE_CONTENT_LINES = 250
 HISTORY_PAGE_LINES = 500
 PREVIEW_CONTENT_LINES = 40
+STREAM_MIN_INTERVAL = 0.05  # At most 20 live snapshots per second/session.
+MAX_SOCKET_QUEUE_DEPTH = 2
+MAX_WATCHED_SESSIONS = 2
 
 sio = socketio.AsyncServer(async_mode="aiohttp", cors_allowed_origins="*")
 app = web.Application()
@@ -56,20 +57,48 @@ screen_size = {"width": 1470, "height": 956}
 watched_by_sid: dict[str, set[str]] = {}
 stream_tasks: dict[str, asyncio.Task] = {}
 last_content: dict[str, dict] = {}
+stream_reconcile_lock = asyncio.Lock()
+
+# Socket.IO/Engine.IO queues are unbounded. Keep a bounded, latest-wins
+# application outbox per client and stop feeding Engine.IO while its real
+# socket queue is backed up (for example when a phone sleeps).
+pending_events: dict[str, dict[str, tuple[str, object]]] = {}
+delivery_wakeups: dict[str, asyncio.Event] = {}
+delivery_tasks: dict[str, asyncio.Task] = {}
 
 # Per-session color palette (default fg/bg + ANSI 0-15), read once from the
 # session's iTerm2 profile so standard colors match the user's actual theme.
 palette_cache: dict[str, dict] = {}
 
 
-# --- Screen geometry (NSScreen, no osascript) ----------------------------------
+# --- Screen geometry (CoreGraphics, no AppKit/osascript) -----------------------
+
+class _CGPoint(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+
+class _CGSize(ctypes.Structure):
+    _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+
+class _CGRect(ctypes.Structure):
+    _fields_ = [("origin", _CGPoint), ("size", _CGSize)]
+
 
 def read_screen_size() -> dict:
-    if NSScreen is None:
-        return {"width": 1470, "height": 956}
     try:
-        frame = NSScreen.screens()[0].frame()
-        return {"width": int(frame.size.width), "height": int(frame.size.height)}
+        core_graphics = ctypes.CDLL(
+            "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        core_graphics.CGMainDisplayID.restype = ctypes.c_uint32
+        core_graphics.CGDisplayBounds.argtypes = [ctypes.c_uint32]
+        core_graphics.CGDisplayBounds.restype = _CGRect
+        bounds = core_graphics.CGDisplayBounds(core_graphics.CGMainDisplayID())
+        if bounds.size.width <= 0 or bounds.size.height <= 0:
+            raise RuntimeError("CoreGraphics did not return a display")
+        return {
+            "width": int(bounds.size.width),
+            "height": int(bounds.size.height),
+        }
     except Exception:
         return {"width": 1470, "height": 956}
 
@@ -229,6 +258,68 @@ async def build_state() -> list:
 _last_pushed_state: str | None = None
 
 
+def _socket_queue_depth(sid: str) -> int | None:
+    """Return Engine.IO's real outbound queue depth for a Socket.IO client."""
+    eio_sid = sio.manager.eio_sid_from_sid(sid, "/")
+    socket = sio.eio.sockets.get(eio_sid) if eio_sid else None
+    return socket.queue.qsize() if socket is not None else None
+
+
+def queue_client_event(
+        sid: str, key: str, event: str, data: object) -> None:
+    """Queue one latest-wins event without growing an unbounded backlog."""
+    if sid not in clients:
+        return
+    outbox = pending_events.get(sid)
+    wakeup = delivery_wakeups.get(sid)
+    if outbox is None or wakeup is None:
+        return
+    outbox[key] = (event, data)
+    wakeup.set()
+
+
+async def _deliver_client_events(sid: str) -> None:
+    """Feed Engine.IO only while a client has capacity for another packet."""
+    wakeup = delivery_wakeups[sid]
+    outbox = pending_events[sid]
+    while sid in clients:
+        await wakeup.wait()
+        wakeup.clear()
+        while sid in clients and outbox:
+            depth = _socket_queue_depth(sid)
+            if depth is None:
+                return
+            if depth >= MAX_SOCKET_QUEUE_DEPTH:
+                await asyncio.sleep(STREAM_MIN_INTERVAL)
+                continue
+            key = next(iter(outbox))
+            event, data = outbox.pop(key)
+            await sio.emit(event, data, to=sid)
+
+
+def start_client_delivery(sid: str) -> None:
+    pending_events[sid] = {}
+    delivery_wakeups[sid] = asyncio.Event()
+    delivery_tasks[sid] = asyncio.create_task(_deliver_client_events(sid))
+
+
+async def stop_client_delivery(sid: str) -> None:
+    task = delivery_tasks.pop(sid, None)
+    if task is not None:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    pending_events.pop(sid, None)
+    delivery_wakeups.pop(sid, None)
+
+
+def queue_content_for_watchers(session_id: str, content: dict) -> None:
+    data = {"sessionId": session_id, **content}
+    for sid, watched in list(watched_by_sid.items()):
+        if session_id in watched:
+            queue_client_event(
+                sid, f"content:{session_id}", "content", data)
+
+
 async def push_state() -> None:
     """Broadcast window/tab state, skipping the emit when nothing changed."""
     global _last_pushed_state
@@ -239,7 +330,8 @@ async def push_state() -> None:
     if serialized == _last_pushed_state:
         return
     _last_pushed_state = serialized
-    await sio.emit("state", state)
+    for sid in list(clients):
+        queue_client_event(sid, "state", "state", state)
 
 
 async def sync_loop() -> None:
@@ -253,6 +345,23 @@ async def sync_loop() -> None:
         await asyncio.sleep(2.0)
         if clients:
             await push_state()
+
+
+async def health_loop() -> None:
+    """Periodic bounded-queue and peak-RSS telemetry for leak diagnosis."""
+    while True:
+        await asyncio.sleep(60)
+        queue_depths = [
+            depth for sid in clients
+            if (depth := _socket_queue_depth(sid)) is not None
+        ]
+        max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        max_rss_mb = max_rss / (1024 * 1024 if sys.platform == "darwin" else 1024)
+        print(
+            "health: "
+            f"max_rss={max_rss_mb:.1f}MB clients={len(clients)} "
+            f"streams={len(stream_tasks)} pending={sum(map(len, pending_events.values()))} "
+            f"engineio_queue_max={max(queue_depths, default=0)}")
 
 
 # --- Reading terminal contents with faithful colors ---------------------------
@@ -493,21 +602,22 @@ async def stream_session(session_id: str) -> None:
     content = await read_content(session_id)
     if content is not None and content["lines"] and clients:
         last_content[session_id] = content
-        await sio.emit("content", {"sessionId": session_id, **content})
+        queue_content_for_watchers(session_id, content)
 
     try:
-        async with session.get_screen_streamer() as streamer:
+        # The notification itself is enough: waiting briefly before fetching the
+        # current screen coalesces bursts of changes and avoids allocating a
+        # stale screen snapshot for every byte of fast terminal output.
+        async with session.get_screen_streamer(want_contents=False) as streamer:
             while True:
-                screen = await streamer.async_get()
+                await streamer.async_get()
+                await asyncio.sleep(STREAM_MIN_INTERVAL)
                 if not clients:
                     continue
-                # Reuse the streamer's current-screen snapshot for cursor
-                # placement instead of requesting the screen a second time.
-                content = await read_content(session_id, screen=screen)
+                content = await read_content(session_id)
                 if content is not None and content != last_content.get(session_id):
                     last_content[session_id] = content
-                    await sio.emit(
-                        "content", {"sessionId": session_id, **content})
+                    queue_content_for_watchers(session_id, content)
     except asyncio.CancelledError:
         raise
     except Exception as err:
@@ -516,30 +626,41 @@ async def stream_session(session_id: str) -> None:
         last_content.pop(session_id, None)
 
 
-def apply_watches() -> None:
+async def apply_watches() -> None:
     """Reconcile running stream tasks with the union of watched sessions."""
-    union: set[str] = set()
-    for ids in watched_by_sid.values():
-        union |= ids
+    async with stream_reconcile_lock:
+        union: set[str] = set()
+        for ids in watched_by_sid.values():
+            union |= ids
 
-    for session_id, task in list(stream_tasks.items()):
-        if session_id not in union:
+        finished = []
+        for session_id, task in list(stream_tasks.items()):
+            if session_id not in union:
+                task.cancel()
+                finished.append(task)
+                stream_tasks.pop(session_id, None)
+            elif task.done():
+                finished.append(task)
+                stream_tasks.pop(session_id, None)  # restart below if wanted
+
+        if finished:
+            await asyncio.gather(*finished, return_exceptions=True)
+
+        if clients:
+            for session_id in union:
+                if session_id not in stream_tasks:
+                    stream_tasks[session_id] = asyncio.create_task(
+                        stream_session(session_id))
+
+
+async def stop_all_streams() -> None:
+    async with stream_reconcile_lock:
+        tasks = list(stream_tasks.values())
+        stream_tasks.clear()
+        for task in tasks:
             task.cancel()
-            stream_tasks.pop(session_id, None)
-        elif task.done():
-            stream_tasks.pop(session_id, None)  # restarted below if still wanted
-
-    if clients:
-        for session_id in union:
-            if session_id not in stream_tasks:
-                stream_tasks[session_id] = asyncio.create_task(
-                    stream_session(session_id))
-
-
-def stop_all_streams() -> None:
-    for task in stream_tasks.values():
-        task.cancel()
-    stream_tasks.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # --- iTerm2 notification monitors (replace the old poll loops) -----------------
@@ -567,6 +688,7 @@ async def connect(sid, environ, auth=None):
         print(f"Rejected unauthenticated client: {sid}")
         raise socketio.exceptions.ConnectionRefusedError("invalid access key")
     clients.add(sid)
+    start_client_delivery(sid)
     print(f"Client connected: {sid}")
     await sio.emit("screenSize", screen_size, to=sid)
     await sio.emit("state", await build_state(), to=sid)
@@ -584,11 +706,12 @@ async def connect(sid, environ, auth=None):
 async def disconnect(sid, reason=None):
     clients.discard(sid)
     watched_by_sid.pop(sid, None)
+    await stop_client_delivery(sid)
     print(f"Client disconnected: {sid}")
     if not clients:
-        stop_all_streams()
+        await stop_all_streams()
     else:
-        apply_watches()
+        await apply_watches()
 
 
 @sio.on("watch")
@@ -596,8 +719,10 @@ async def on_watch(sid, data):
     # The client lists the sessions it is currently viewing (main + split panes);
     # we live-stream exactly that union across all clients.
     ids = data.get("sessionIds") or []
-    watched_by_sid[sid] = {s for s in ids if s and s != "undefined"}
-    apply_watches()
+    watched_by_sid[sid] = {
+        s for s in ids[:MAX_WATCHED_SESSIONS] if s and s != "undefined"
+    }
+    await apply_watches()
 
 
 @sio.event
@@ -611,8 +736,9 @@ async def on_get_content(sid, data):
     session_id = data.get("sessionId")
     content = await read_content(session_id)
     if content and content["lines"]:
-        await sio.emit(
-            "content", {"sessionId": session_id, **content}, to=sid)
+        queue_client_event(
+            sid, f"content:{session_id}", "content",
+            {"sessionId": session_id, **content})
 
 
 @sio.on("getAllContent")
@@ -622,8 +748,9 @@ async def on_get_all_content(sid, data):
     async def one(session_id):
         content = await read_content(session_id, PREVIEW_CONTENT_LINES)
         if content and content["lines"]:
-            await sio.emit(
-                "content", {"sessionId": session_id, **content}, to=sid)
+            queue_client_event(
+                sid, f"content:{session_id}", "content",
+                {"sessionId": session_id, **content})
 
     await asyncio.gather(*(one(s) for s in session_ids))
 
@@ -637,8 +764,9 @@ async def on_get_earlier_content(sid, data):
     content = await read_content(
         session_id, HISTORY_PAGE_LINES, before_line=before_line)
     if content:
-        await sio.emit(
-            "historyContent", {"sessionId": session_id, **content}, to=sid)
+        queue_client_event(
+            sid, f"history:{session_id}:{before_line}", "historyContent",
+            {"sessionId": session_id, **content})
 
 
 @sio.on("execute")
@@ -736,9 +864,12 @@ async def main() -> None:
     await site.start()
     print(f"Server running on http://0.0.0.0:{PORT}")
 
-    asyncio.create_task(layout_monitor())
-    asyncio.create_task(focus_monitor())
-    asyncio.create_task(sync_loop())
+    background_tasks = [
+        asyncio.create_task(layout_monitor()),
+        asyncio.create_task(focus_monitor()),
+        asyncio.create_task(sync_loop()),
+        asyncio.create_task(health_loop()),
+    ]
 
     # Clean shutdown (incl. `iterm-server stop`, which sends SIGTERM).
     stop = asyncio.Event()
@@ -751,6 +882,13 @@ async def main() -> None:
     try:
         await stop.wait()
     finally:
+        for task in background_tasks:
+            task.cancel()
+        await asyncio.gather(*background_tasks, return_exceptions=True)
+        await stop_all_streams()
+        for sid in list(delivery_tasks):
+            clients.discard(sid)
+            await stop_client_delivery(sid)
         await runner.cleanup()
 
 

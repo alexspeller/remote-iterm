@@ -1,6 +1,17 @@
+import asyncio
 import unittest
 
-from server.server import _DEFAULT_PALETTE, _content_line_range, _line_runs
+from server.server import (
+    _DEFAULT_PALETTE,
+    _content_line_range,
+    _line_runs,
+    clients,
+    delivery_wakeups,
+    pending_events,
+    queue_client_event,
+    queue_content_for_watchers,
+    watched_by_sid,
+)
 
 
 class _DefaultColor:
@@ -72,6 +83,36 @@ class ContentLineRangeTest(unittest.TestCase):
             _content_line_range(Info(), 500, before_line=600),
             (275, 325, 275, 10_315),
         )
+
+
+class BoundedDeliveryTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        clients.update({"watching", "other"})
+        watched_by_sid.update({"watching": {"session-1"}, "other": {"session-2"}})
+        for sid in clients:
+            pending_events[sid] = {}
+            delivery_wakeups[sid] = asyncio.Event()
+
+    async def asyncTearDown(self):
+        clients.clear()
+        watched_by_sid.clear()
+        pending_events.clear()
+        delivery_wakeups.clear()
+
+    async def test_replaces_an_undelivered_snapshot_instead_of_growing(self):
+        queue_client_event("watching", "content:session-1", "content", {"value": 1})
+        queue_client_event("watching", "content:session-1", "content", {"value": 2})
+
+        self.assertEqual(
+            pending_events["watching"],
+            {"content:session-1": ("content", {"value": 2})},
+        )
+
+    async def test_terminal_content_is_queued_only_for_its_watchers(self):
+        queue_content_for_watchers("session-1", {"lines": ["latest"]})
+
+        self.assertEqual(len(pending_events["watching"]), 1)
+        self.assertEqual(pending_events["other"], {})
 
 
 if __name__ == "__main__":
