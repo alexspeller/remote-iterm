@@ -117,7 +117,7 @@ iterm-snapshot install              # auto-start remote-iterm whenever iTerm2 la
 
 So the crash-recovery flow is simply: reopen iTerm2, run `iterm-snapshot restore`.
 
-Restore recreates each window/tab/split, `cd`s every pane back to its directory, and **echoes** the pane's previous output above a fresh prompt — it can't revive the running process, but you see what was there and the command that was running. It never touches your existing windows; split proportions are approximate.
+Restore recreates each window/tab/split, `cd`s every pane back to its directory, restores custom tab titles (like the `🧰 <project>` labels set by a project launcher), and **echoes** the pane's previous output above a fresh prompt — it can't revive the running process, but you see what was there and the command that was running. It never touches your existing windows; split proportions are approximate.
 
 `iterm-snapshot install` symlinks an AutoLaunch supervisor into iTerm2's scripts folder so the server, web client, and snapshotter all start automatically with iTerm2 and stop when it quits — no need to remember to launch anything.
 

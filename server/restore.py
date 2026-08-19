@@ -34,6 +34,17 @@ def split_count(node) -> int:
     return sum(split_count(c) for c in children) + max(0, len(children) - 1)
 
 
+_ATTENTION_PREFIX = "🔔 "  # transient highlighter marker, not part of a tab's identity
+
+
+def clean_title(title) -> str:
+    """A tab's restorable title override, minus any transient bell marker."""
+    title = title or ""
+    while title.startswith(_ATTENTION_PREFIX):
+        title = title[len(_ATTENTION_PREFIX):]
+    return title
+
+
 # --- live replay ---------------------------------------------------------------
 
 async def _configure(session, meta, content_dir) -> None:
@@ -103,6 +114,14 @@ async def restore(connection, snapshot: dict, content_dir=None) -> int:
                 itab = await window.async_create_tab()
                 if itab is None:
                     continue
+            # Replay an explicit tab title (e.g. a "🧰 <project>" set by
+            # ~/bin/project) so restored project tabs keep their identity.
+            override = clean_title(tab.get("titleOverride"))
+            if override:
+                try:
+                    await itab.async_set_title(override)
+                except Exception:
+                    pass
             root = itab.current_session
             if root is None:
                 continue

@@ -204,10 +204,17 @@ class Snapshotter:
         return entry
 
     async def _tab_entry(self, window, tab, index: int, current_tab_id) -> dict:
-        try:
-            title = await tab.async_get_variable("title")
-        except Exception:
-            title = None
+        async def tab_var(name):
+            try:
+                return await tab.async_get_variable(name)
+            except Exception:
+                return None
+
+        # `title` is the displayed title (for the human-readable map). The
+        # explicit `titleOverride` is what a tool like ~/bin/project sets
+        # ("🧰 <name>"); restore replays it so a project tab keeps its identity.
+        title = await tab_var("title")
+        title_override = await tab_var("titleOverride")
         rects, aspect, maximized = pane_layout(tab)
         tree = serialize_tree(tab.root)
 
@@ -237,6 +244,7 @@ class Snapshotter:
         return {
             "index": index,
             "title": title or "",
+            "titleOverride": title_override or "",
             "isSelected": tab.tab_id == current_tab_id,
             "currentSessionId": cur.session_id if cur else "",
             "aspect": round(aspect, 4),
@@ -411,6 +419,7 @@ def _history_record(clean: dict) -> dict:
                      for p in tab["panes"]]
             tabs.append({
                 "index": tab["index"], "title": tab["title"],
+                "titleOverride": tab.get("titleOverride", ""),
                 "isSelected": tab["isSelected"], "maximized": tab["maximized"],
                 "currentSessionId": tab.get("currentSessionId", ""),
                 "tree": tab["tree"],

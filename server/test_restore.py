@@ -1,6 +1,6 @@
 import unittest
 
-from server.restore import pane_ids, plan_text, split_count
+from server.restore import clean_title, pane_ids, plan_text, split_count
 
 PANE = lambda i: {"type": "pane", "id": i}  # noqa: E731
 
@@ -27,6 +27,13 @@ class RestorePureTest(unittest.TestCase):
         ]}
         self.assertEqual(pane_ids(grid), ["a", "b", "c", "d"])
         self.assertEqual(split_count(grid), len(pane_ids(grid)) - 1)
+
+    def test_clean_title_keeps_project_identity_strips_bell(self):
+        self.assertEqual(clean_title("🧰 mailai"), "🧰 mailai")
+        self.assertEqual(clean_title("🔔 🧰 mailai"), "🧰 mailai")
+        self.assertEqual(clean_title("🔔 🔔 x"), "x")
+        self.assertEqual(clean_title(""), "")
+        self.assertEqual(clean_title(None), "")
 
     def test_plan_text_lists_panes(self):
         snap = {"windows": [{"tabs": [{
