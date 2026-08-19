@@ -3,7 +3,8 @@
   "version": "1.0.1",
   "description": "Control iTerm2 from your phone with a native, event-driven iTerm2 integration",
   "bin": {
-    "remote-iterm": "iterm-server"
+    "remote-iterm": "iterm-server",
+    "iterm-snapshot": "iterm-snapshot"
   },
   "scripts": {
     "postinstall": "cd client && npm install",
@@ -44,6 +45,8 @@
   },
   "files": [
     "iterm-server",
+    "iterm-snapshot",
+    "autolaunch/",
     "server/",
     "client/",
     "!server/.venv",

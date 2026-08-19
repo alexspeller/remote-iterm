@@ -91,6 +91,33 @@ For the component model, data flow, Socket.IO contract, and design trade-offs, s
 - Connection latency indicator and automatic reconnect
 - Screen wake lock, scroll lock, and optional completion vibration
 - Installable PWA
+- Continuous state snapshots for crash recovery, with an ASCII layout map and one-command restore
+
+## State snapshots & crash recovery
+
+remote-iterm continuously records your full iTerm2 layout so you can recover it after a crash or accidental quit. An independent snapshotter (started alongside the server) writes, on every layout/focus change and a periodic heartbeat:
+
+- an **ASCII map** of every window, tab, and pane (`latest/layout.txt`) — including all panes of a maximized tab,
+- a structured snapshot for restore (`latest/state.json`) and a ~200-line plain-text tail of each pane (`latest/panes/`),
+- a 14-day **history** of layout + metadata (`history/<date>.jsonl`).
+
+Use the `iterm-snapshot` CLI:
+
+```bash
+iterm-snapshot show                        # print the latest layout map
+iterm-snapshot list                        # list retained snapshots
+iterm-snapshot restore                     # rebuild the latest layout into NEW windows
+iterm-snapshot restore --dry-run           # show what restore would recreate
+iterm-snapshot restore --at 2026-08-19T14  # restore a past moment (layout + cwd only)
+iterm-snapshot install                     # auto-start remote-iterm whenever iTerm2 launches
+```
+
+Restore recreates each window/tab/split, `cd`s every pane back to its directory, and **echoes** the pane's previous output above a fresh prompt — it can't revive the running process, but you see what was there and the command that was running. It never touches your existing windows; split proportions are approximate.
+
+`iterm-snapshot install` symlinks an AutoLaunch supervisor into iTerm2's scripts folder so the server, web client, and snapshotter all start automatically with iTerm2 and stop when it quits — no need to remember to launch anything.
+
+> [!NOTE]
+> Snapshots include pane command lines and recent output, which may contain secrets (API keys, tokens). They live in a user-only directory (`0700`/`0600`) under `~/Library/Application Support/remote-iterm/snapshots` — the same trust level as your shell history and terminal scrollback.
 
 ## Requirements
 
@@ -120,8 +147,12 @@ mise exec -- npm install
 mise exec -- npm --prefix client run build
 
 # After ./iterm-server has created server/.venv
-mise exec -- server/.venv/bin/python -m unittest server/test_server.py
+mise exec -- server/.venv/bin/python -m unittest \
+  server.test_server server.test_auth server.test_geometry \
+  server.test_ascii_layout server.test_snapshot server.test_restore
 ```
+
+The snapshot, geometry, ASCII-layout, and restore unit tests are pure Python and need neither a phone nor a running iTerm2.
 
 The backend requires a running iTerm2 instance and permission to use its Python API for integration testing. The client build and isolated rendering tests do not require a phone.
 
@@ -133,6 +164,8 @@ The backend requires a running iTerm2 instance and permission to use its Python 
 - `.iterm-server.log` — combined server and client log
 - `server/.venv` — automatically managed Python environment
 - `~/Library/Application Support/remote-iterm/access-key` — generated shared key (`0600` permissions)
+- `~/Library/Application Support/remote-iterm/snapshots/` — layout snapshots, per-pane content, and 14-day history
+- `autolaunch/remote-iterm.py` — iTerm2 AutoLaunch supervisor (installed via `iterm-snapshot install`)
 
 ## Project lineage
 

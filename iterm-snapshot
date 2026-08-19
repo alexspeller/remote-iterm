@@ -1,0 +1,19 @@
+#!/bin/bash
+# Remote iTerm — state snapshot / restore CLI (thin wrapper over the venv python).
+
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
+DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+
+# Global install: node_modules/.bin -> package root.
+if [[ "$DIR" == *"node_modules"* ]]; then
+  DIR="$(cd "$DIR/../../remote-iterm" && pwd)"
+fi
+
+VENV="$DIR/server/.venv"
+if [ ! -x "$VENV/bin/python" ]; then
+  echo "  Python environment missing. Run 'remote-iterm' once to create it." >&2
+  exit 1
+fi
+
+exec "$VENV/bin/python" "$DIR/server/snapshot_cli.py" "$@"

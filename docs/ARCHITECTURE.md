@@ -71,6 +71,14 @@ The Vite/React client maintains the selected window, tab, and session separately
 
 The client is an installable PWA, but it is still a web application served by the Mac. There is no cloud relay or hosted control plane.
 
+### State snapshotter (`server/snapshot.py`)
+
+An independent process — deliberately separate from the phone server so a bug in one cannot silence the other, and so snapshots keep flowing whether or not any phone is connected. It holds its own iTerm2 API connection and, on layout/focus notifications (debounced) plus a periodic heartbeat, serializes every window → tab → pane: the split tree, each pane's cwd / foreground job / command line, and a plain-text tail of its output. It reuses `server/geometry.py` for the split geometry and `server/ascii_layout.py` to draw the layout map. It writes an always-current `latest/` snapshot (with full per-pane content) and appends a change-deduplicated, 14-day-pruned `history/` log of layout + metadata only. See [State snapshots and restore](#state-snapshots-and-restore).
+
+### AutoLaunch supervisor (`autolaunch/remote-iterm.py`)
+
+A stdlib-only iTerm2 AutoLaunch script (installed via `iterm-snapshot install`) that starts the whole stack — phone server, Vite client, and snapshotter — through the existing `iterm-server` launcher whenever iTerm2 launches, and stops it when iTerm2 quits. It intentionally does not import the iTerm2 API (which would consume the single AutoLaunch `ITERM2_COOKIE` the child processes need) and runs the children through the user's login shell so their real `PATH` (for `npx vite`) is present. iTerm2 quit is detected via a signal handler and a parent-pid watch.
+
 ## Socket.IO contract
 
 The protocol intentionally evolves the upstream event names where possible so the UI and backend remain loosely coupled.
@@ -97,9 +105,22 @@ Styled terminal content is run-length encoded. Each run uses `t` for text and ma
 
 ## Pane geometry
 
-iTerm2 represents a tab as nested splitters. A vertical splitter arranges children left-to-right; a horizontal splitter arranges them top-to-bottom. The server recursively calculates each child's natural size, then assigns normalized rectangles from `0` to `1`. The client can therefore reproduce mixed nested layouts without knowing the Mac's pixel dimensions.
+iTerm2 represents a tab as nested splitters. A vertical splitter arranges children left-to-right; a horizontal splitter arranges them top-to-bottom. The recursion that calculates each child's natural size and assigns normalized rectangles from `0` to `1` lives in `server/geometry.py`, shared by the phone server and the snapshotter. The client can therefore reproduce mixed nested layouts without knowing the Mac's pixel dimensions.
 
 When iTerm2 maximizes a pane, the frames for minimized sessions are unavailable. The server keeps those sessions discoverable and deliberately falls back to an even grid rather than presenting fabricated split proportions.
+
+## State snapshots and restore
+
+The snapshotter turns the live geometry into durable, recoverable state under `~/Library/Application Support/remote-iterm/snapshots/`:
+
+- `latest/layout.txt` — a human-readable ASCII map of every window/tab/pane plus a per-pane table (cwd, job, last command), the file to open after a crash.
+- `latest/state.json` — the full structured snapshot, including each tab's serialized split tree, for restore.
+- `latest/panes/<id>.txt` — a ~200-line plain-text tail of each pane (the source for restore's content echo, also greppable).
+- `history/<date>.jsonl` — one record per *changed* layout (deduplicated like the server's `push_state`), carrying layout + metadata only (no content), pruned to 14 days.
+
+**Maximized tabs.** Because the snapshotter runs continuously it can do better than a one-shot capture: it caches each tab's last split tree seen while *not* maximized and renders/restores that when the tab is later maximized (whose live tree has collapsed to a single pane). A tab that has only ever been seen maximized falls back to a grid tree over all its panes, so no pane is lost.
+
+**Restore (`server/restore.py`).** Restore replays a snapshot into **new** windows — it never touches existing ones. For each tab it recreates the split tree with `async_split_pane` (matching orientation; proportions are approximate because the API always halves), `cd`s each pane to its saved directory, and uses `async_inject` to *display* the pane's previous output without executing it, followed by a note of the command that was running. Running processes cannot be revived. Restoring from a history record (`--at`) rebuilds layout and cwds but has no content to echo.
 
 ## Input semantics
 
