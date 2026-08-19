@@ -24,6 +24,7 @@ import copy
 import json
 import math
 import os
+import shutil
 import tempfile
 import time
 import traceback
@@ -44,11 +45,17 @@ SNAPSHOT_DIR = SUPPORT_DIR / "snapshots"
 LATEST_DIR = SNAPSHOT_DIR / "latest"
 PANES_DIR = LATEST_DIR / "panes"
 HISTORY_DIR = SNAPSHOT_DIR / "history"
+# Full, content-bearing archives of each completed session. One is created at
+# snapshotter startup from the outgoing `latest/` *before* the new session
+# overwrites it — so reopening iTerm after a crash preserves the pre-crash
+# session (layout + content) instead of clobbering it with the blank one.
+SESSIONS_DIR = SNAPSHOT_DIR / "sessions"
 LOG_PATH = SNAPSHOT_DIR / "snapshot.log"
 
 SNAPSHOT_VERSION = 1
 TAIL_LINES = 200
 RETENTION_DAYS = 14
+MAX_SESSION_ARCHIVES = 20
 
 DEBOUNCE_SECONDS = 1.5      # coalesce a burst of change notifications
 MIN_INTERVAL_SECONDS = 4.0  # floor between successive snapshots
@@ -295,6 +302,38 @@ class Snapshotter:
         _atomic_write(LATEST_DIR / "layout.txt", render_snapshot_text(clean))
         return clean
 
+    def _archive_previous_session(self) -> None:
+        """Preserve the outgoing `latest/` (with content) as a session archive.
+
+        Called once at startup, before the first snapshot of the new session
+        overwrites `latest/`. After a crash+reopen this is what keeps the
+        pre-crash session recoverable (``iterm-snapshot restore``) instead of it
+        being replaced by the blank reopened session.
+        """
+        state = LATEST_DIR / "state.json"
+        if not state.exists():
+            return
+        try:
+            captured = json.loads(state.read_text()).get("capturedAt", "")
+        except Exception:
+            captured = ""
+        stamp = _safe_id(captured) if captured else "unknown"
+        dest = SESSIONS_DIR / stamp
+        if dest.exists():
+            return  # already archived (e.g. a restart within the same second)
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SESSIONS_DIR / (".tmp-" + stamp)
+        try:
+            if tmp.exists():
+                shutil.rmtree(tmp)
+            shutil.copytree(LATEST_DIR, tmp)
+            os.replace(tmp, dest)
+            log(f"archived previous session -> sessions/{stamp}")
+        except Exception as err:
+            log(f"archive previous session failed: {err}")
+            shutil.rmtree(tmp, ignore_errors=True)
+        _prune_sessions()
+
     def _append_history(self, clean: dict) -> None:
         record = _history_record(clean)
         key = json.dumps(record["windows"], sort_keys=True)
@@ -347,6 +386,8 @@ class Snapshotter:
 
     async def run(self) -> None:
         _prune_history()
+        # Preserve the previous session BEFORE the first snapshot overwrites it.
+        self._archive_previous_session()
         log("snapshotter started")
         await self.snapshot()  # capture immediately on startup
         await asyncio.gather(
@@ -449,6 +490,30 @@ def _prune_history() -> None:
                 f.unlink()
             except OSError:
                 pass
+
+
+def session_archives() -> list:
+    """Session-archive dirs, newest first. Names are _safe_id(capturedAt), which
+    sort chronologically, so lexical sort == chronological."""
+    if not SESSIONS_DIR.exists():
+        return []
+    dirs = [d for d in SESSIONS_DIR.iterdir()
+            if d.is_dir() and not d.name.startswith(".tmp-")]
+    return sorted(dirs, key=lambda d: d.name, reverse=True)
+
+
+def _prune_sessions() -> None:
+    archives = session_archives()
+    today = date.today()
+    for i, d in enumerate(archives):
+        too_many = i >= MAX_SESSION_ARCHIVES
+        too_old = False
+        try:
+            too_old = (today - date.fromisoformat(d.name[:10])).days > RETENTION_DAYS
+        except ValueError:
+            pass
+        if too_many or too_old:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 async def main(connection) -> None:

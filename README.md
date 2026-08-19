@@ -100,16 +100,22 @@ remote-iterm continuously records your full iTerm2 layout so you can recover it 
 - a structured snapshot for restore (`latest/state.json`) and a ~200-line plain-text tail of each pane (`latest/panes/`),
 - a 14-day **history** of layout + metadata (`history/<date>.jsonl`).
 
+**Surviving a crash.** The catch a naïve snapshotter would hit: when you reopen iTerm2 after a crash, the snapshotter starts capturing the *new* (blank) session and would overwrite the good one. To avoid that, at startup — **before** it captures anything — the snapshotter archives the outgoing `latest/` (with its content) into `sessions/<timestamp>/`. So the pre-crash session is preserved intact, and `iterm-snapshot restore` defaults to **that last completed session**, not the blank one you just opened. The last 20 sessions (within 14 days) are kept.
+
 Use the `iterm-snapshot` CLI:
 
 ```bash
-iterm-snapshot show                        # print the latest layout map
-iterm-snapshot list                        # list retained snapshots
-iterm-snapshot restore                     # rebuild the latest layout into NEW windows
-iterm-snapshot restore --dry-run           # show what restore would recreate
-iterm-snapshot restore --at 2026-08-19T14  # restore a past moment (layout + cwd only)
-iterm-snapshot install                     # auto-start remote-iterm whenever iTerm2 launches
+iterm-snapshot show                 # print the latest layout map
+iterm-snapshot list                 # list restorable sessions + history
+iterm-snapshot restore              # rebuild your LAST completed session (post-crash default)
+iterm-snapshot restore --dry-run    # show what restore would recreate
+iterm-snapshot restore --current    # rebuild the current live session instead
+iterm-snapshot restore --session TS # rebuild a specific archived session (see `list`)
+iterm-snapshot restore --at TS      # rebuild from history (layout + cwd only, no content)
+iterm-snapshot install              # auto-start remote-iterm whenever iTerm2 launches
 ```
+
+So the crash-recovery flow is simply: reopen iTerm2, run `iterm-snapshot restore`.
 
 Restore recreates each window/tab/split, `cd`s every pane back to its directory, and **echoes** the pane's previous output above a fresh prompt — it can't revive the running process, but you see what was there and the command that was running. It never touches your existing windows; split proportions are approximate.
 
@@ -163,7 +169,7 @@ The backend requires a running iTerm2 instance and permission to use its Python 
 - `.iterm-server.log` — combined server and client log
 - `server/.venv` — automatically managed Python environment
 - `~/Library/Application Support/remote-iterm/access-key` — generated shared key (`0600` permissions)
-- `~/Library/Application Support/remote-iterm/snapshots/` — layout snapshots, per-pane content, and 14-day history
+- `~/Library/Application Support/remote-iterm/snapshots/` — live `latest/`, per-session `sessions/` archives (with content), and 14-day `history/`
 - `autolaunch/remote-iterm.py` — iTerm2 AutoLaunch supervisor (installed via `iterm-snapshot install`)
 
 ## Project lineage

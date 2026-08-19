@@ -71,6 +71,65 @@ class GridTreeTest(unittest.TestCase):
         self.assertEqual(S._grid_tree([])["type"], "pane")
 
 
+class SessionArchiveTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        # Also redirect LOG_PATH so the test's log() calls don't pollute the
+        # real snapshot.log.
+        self._orig = (S.LATEST_DIR, S.SESSIONS_DIR, S.MAX_SESSION_ARCHIVES,
+                      S.LOG_PATH, S.SNAPSHOT_DIR)
+        S.LATEST_DIR = root / "latest"
+        S.SESSIONS_DIR = root / "sessions"
+        S.MAX_SESSION_ARCHIVES = 3
+        S.SNAPSHOT_DIR = root
+        S.LOG_PATH = root / "snapshot.log"
+        (S.LATEST_DIR / "panes").mkdir(parents=True)
+
+    def tearDown(self):
+        (S.LATEST_DIR, S.SESSIONS_DIR, S.MAX_SESSION_ARCHIVES,
+         S.LOG_PATH, S.SNAPSHOT_DIR) = self._orig
+        self._tmp.cleanup()
+
+    def _write_latest(self, captured):
+        (S.LATEST_DIR / "state.json").write_text(
+            json.dumps({"capturedAt": captured, "windows": []}))
+        (S.LATEST_DIR / "panes" / "p_A.txt").write_text("scrollback here\n")
+
+    def test_archive_preserves_latest_with_content(self):
+        self._write_latest("2026-08-19T10:00:00+00:00")
+        S.Snapshotter(None, None)._archive_previous_session()
+        archives = S.session_archives()
+        self.assertEqual(len(archives), 1)
+        # the archived session carries the pane content (needed for echo-restore)
+        self.assertTrue((archives[0] / "panes" / "p_A.txt").exists())
+        self.assertTrue((archives[0] / "state.json").exists())
+
+    def test_archive_is_idempotent_per_capture(self):
+        self._write_latest("2026-08-19T10:00:00+00:00")
+        snap = S.Snapshotter(None, None)
+        snap._archive_previous_session()
+        snap._archive_previous_session()  # same capturedAt -> no duplicate
+        self.assertEqual(len(S.session_archives()), 1)
+
+    def test_archives_are_newest_first_and_pruned(self):
+        snap = S.Snapshotter(None, None)
+        for captured in ["2026-08-19T09:00:00+00:00", "2026-08-19T10:00:00+00:00",
+                         "2026-08-19T11:00:00+00:00", "2026-08-19T12:00:00+00:00",
+                         "2026-08-19T13:00:00+00:00"]:
+            self._write_latest(captured)
+            snap._archive_previous_session()
+        archives = S.session_archives()
+        self.assertEqual(len(archives), 3)  # MAX_SESSION_ARCHIVES
+        # newest first, and the oldest two were pruned
+        self.assertTrue(archives[0].name.startswith("2026-08-19T13"))
+        self.assertTrue(archives[-1].name.startswith("2026-08-19T11"))
+
+    def test_no_latest_no_archive(self):
+        S.Snapshotter(None, None)._archive_previous_session()  # no state.json
+        self.assertEqual(S.session_archives(), [])
+
+
 class HistoryFsTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

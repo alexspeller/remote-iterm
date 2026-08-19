@@ -74,7 +74,7 @@ The client is an installable PWA, but it is still a web application served by th
 
 ### State snapshotter (`server/snapshot.py`)
 
-An independent process — deliberately separate from the phone server so a bug in one cannot silence the other, and so snapshots keep flowing whether or not any phone is connected. It holds its own iTerm2 API connection and, on layout/focus notifications (debounced) plus a periodic heartbeat, serializes every window → tab → pane: the split tree, each pane's cwd / foreground job / command line, and a plain-text tail of its output. It reuses `server/geometry.py` for the split geometry and `server/ascii_layout.py` to draw the layout map. It writes an always-current `latest/` snapshot (with full per-pane content) and appends a change-deduplicated, 14-day-pruned `history/` log of layout + metadata only. See [State snapshots and restore](#state-snapshots-and-restore).
+An independent process — deliberately separate from the phone server so a bug in one cannot silence the other, and so snapshots keep flowing whether or not any phone is connected. It holds its own iTerm2 API connection and, on layout/focus notifications (debounced) plus a periodic heartbeat, serializes every window → tab → pane: the split tree, each pane's cwd / foreground job / command line, and a plain-text tail of its output. It reuses `server/geometry.py` for the split geometry and `server/ascii_layout.py` to draw the layout map. It writes an always-current `latest/` snapshot (with full per-pane content), archives the previous session into `sessions/` at startup so a crash+reopen can't clobber it, and appends a change-deduplicated, 14-day-pruned `history/` log of layout + metadata only. See [State snapshots and restore](#state-snapshots-and-restore).
 
 ### AutoLaunch supervisor (`autolaunch/remote-iterm.py`)
 
@@ -117,7 +117,10 @@ The snapshotter turns the live geometry into durable, recoverable state under `~
 - `latest/layout.txt` — a human-readable ASCII map of every window/tab/pane plus a per-pane table (cwd, job, last command), the file to open after a crash.
 - `latest/state.json` — the full structured snapshot, including each tab's serialized split tree, for restore.
 - `latest/panes/<id>.txt` — a ~200-line plain-text tail of each pane (the source for restore's content echo, also greppable).
+- `sessions/<timestamp>/` — a full, content-bearing copy of a *completed* session (same shape as `latest/`). Keeps the last 20 within 14 days.
 - `history/<date>.jsonl` — one record per *changed* layout (deduplicated like the server's `push_state`), carrying layout + metadata only (no content), pruned to 14 days.
+
+**Surviving reopen (the key crash-recovery mechanism).** `latest/` is overwritten continuously, so the naïve failure mode is: iTerm2 crashes, you reopen it, the snapshotter starts capturing the new blank session and overwrites the pre-crash one before you can restore it. To prevent this, the snapshotter's very first action at startup — before it captures anything — is to copy the outgoing `latest/` (content included) into `sessions/<its capturedAt>/`. Because the snapshotter is an AutoLaunch process, "startup" happens every time iTerm2 launches, so each session's final state is preserved as an archive. `iterm-snapshot restore` therefore defaults to the newest `sessions/` archive — i.e. your last completed session, with content — rather than the live `latest/` (available via `--current`). The crash-recovery flow reduces to: reopen iTerm2, run `iterm-snapshot restore`.
 
 **Maximized tabs.** Because the snapshotter runs continuously it can do better than a one-shot capture: it caches each tab's last split tree seen while *not* maximized and renders/restores that when the tab is later maximized (whose live tree has collapsed to a single pane). A tab that has only ever been seen maximized falls back to a grid tree over all its panes, so no pane is lost.
 
