@@ -65,6 +65,7 @@ The Vite/React client maintains the selected window, tab, and session separately
 - Renders a tab's real split geometry as a spatial picker.
 - Offers both horizontal tab strips and vertical tab lists for fast selection.
 - Sends all input to the currently focused mobile pane.
+- Provides a direct-input mode that keeps the native mobile keyboard open and forwards text and terminal keys immediately, while retaining the separate buffered command field.
 - Stores command history only in browser `localStorage`.
 - Reconnects indefinitely and measures Socket.IO round-trip latency.
 - Reads the shared key from the URL fragment, remembers it in browser `localStorage`, and sends it in the Socket.IO authentication payload.
@@ -127,7 +128,7 @@ The snapshotter turns the live geometry into durable, recoverable state under `~
 The service writes directly to the target iTerm2 session:
 
 - Commands end with carriage return (`0x0d`), matching a physical Return key in shells and raw-mode terminal applications.
-- Quick actions and the virtual keyboard use the actual control characters or ANSI escape sequences instead of printable labels.
+- Quick actions and native direct input use the actual control characters or ANSI escape sequences instead of printable labels.
 - Mobile split focus controls which session receives input; it does not need to change the pane focused in iTerm2 on the Mac.
 
 ## Trust and security model

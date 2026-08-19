@@ -8,8 +8,7 @@ Control macOS iTerm2 from a phone on your local network.
 The current fork replaces the original Node.js/AppleScript server with an event-driven Python service built on iTerm2's native API. It also extends the mobile client with first-class split-pane navigation, live pane previews, faithful terminal colors and cursor rendering, and terminal-correct key input.
 
 <p align="center">
-  <img src="docs/images/pane-switcher.png" alt="Spatial pane switcher showing live previews of three iTerm2 panes" width="48%">
-  <img src="docs/images/mobile-keyboard.png" alt="Remote iTerm mobile terminal with the virtual keyboard open" width="48%">
+  <img src="docs/images/pane-switcher.png" alt="Spatial pane switcher showing live previews of three iTerm2 panes" width="70%">
 </p>
 
 ## Install this fork
@@ -59,7 +58,7 @@ On first launch, iTerm2 asks for one-time Automation permission so the Python AP
 - Discovers every pane in a tab, including minimized panes when one pane is maximized.
 - Reconstructs nested iTerm2 split geometry and provides a spatial pane map with live terminal previews.
 - Can display and independently control two sessions at once, in a horizontal or vertical mobile split.
-- Adds a multi-layer virtual keyboard with staggered letter rows, symbols, arrows, modifiers, and terminal shortcuts.
+- Offers native mobile-keyboard input that can send text, Delete, Return, Tab, Escape, and arrows directly to the terminal as they are typed.
 
 ### More robust lifecycle
 
@@ -84,7 +83,7 @@ For the component model, data flow, Socket.IO contract, and design trade-offs, s
 - Multi-window spatial map
 - Broadcast commands to selected windows
 - Persistent command history with arrow navigation
-- Virtual keyboard and raw terminal keys
+- Native keyboard direct-input mode and raw terminal keys
 - Quick actions such as Ctrl+C, Escape, arrows, and Tab
 - Clipboard paste and terminal-output copy
 - Landscape layout and iPhone safe-area handling

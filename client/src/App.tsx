@@ -1,6 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, memo } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, LayoutGrid, List as ListIcon, KeyRound } from 'lucide-react';
+import { Plus, X, Send, Clock, ChevronUp, ChevronDown, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, LayoutGrid, List as ListIcon, KeyRound } from 'lucide-react';
 
 // --- Types ---
 interface PaneRect { x: number; y: number; w: number; h: number; }
@@ -35,6 +35,17 @@ const HISTORY_KEY = 'iterm-cmd-history';
 const ACCESS_KEY_STORAGE_KEY = 'remote-iterm-access-key';
 const MAX_HISTORY = 100;
 const BOTTOM_THRESHOLD_PX = 4;
+const DIRECT_INPUT_KEYS: Record<string, string> = {
+  Enter: '\r',
+  Backspace: '\x7f',
+  Delete: '\x1b[3~',
+  Tab: '\t',
+  Escape: '\x1b',
+  ArrowUp: '\x1b[A',
+  ArrowDown: '\x1b[B',
+  ArrowRight: '\x1b[C',
+  ArrowLeft: '\x1b[D',
+};
 
 function isScrolledToBottom(element: HTMLDivElement): boolean {
   return element.scrollHeight - element.scrollTop - element.clientHeight <= BOTTOM_THRESHOLD_PX;
@@ -122,11 +133,12 @@ export default function App() {
   const [screenSize, setScreenSize] = useState<ScreenSize | null>(null);
   const [content, setContent] = useState<StyledContent | null>(null);
   const [command, setCommand] = useState('');
+  const [directInputMode, setDirectInputMode] = useState(false);
+  const [directInputValue, setDirectInputValue] = useState('');
   const [selectedWinId, setSelectedWinId] = useState<string | null>(null);
   const [selectedTabId, setSelectedTabId] = useState<string | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [showMap, setShowMap] = useState(false);
-  const [keyboardMode, setKeyboardMode] = useState(false);
   const [scrollLocked, setScrollLocked] = useState(false);
   const [broadcastMode, setBroadcastMode] = useState(false);
   const [broadcastTargets, setBroadcastTargets] = useState<Set<string>>(new Set());
@@ -147,6 +159,7 @@ export default function App() {
   // content arrives (cache lives in a ref, so it can't trigger renders itself).
   const [, setPreviewTick] = useState(0);
   const socketRef = useRef<Socket | null>(null);
+  const commandInputRef = useRef<HTMLInputElement>(null);
   const contentRef = useRef<HTMLDivElement>(null);
   const splitContentRef = useRef<HTMLDivElement>(null);
   const primaryAtBottomRef = useRef(true);
@@ -626,6 +639,57 @@ export default function App() {
 
   const sendSpecialKey = (keys: string) => {
     socketRef.current?.emit('sendKeys', { sessionId: getActiveSessionId(), keys });
+  };
+
+  const toggleDirectInput = () => {
+    if (directInputMode) {
+      setDirectInputMode(false);
+      setDirectInputValue('');
+      commandInputRef.current?.blur();
+      return;
+    }
+
+    // The input is already mounted, so this focus remains inside the tap event.
+    // iOS otherwise may refuse to open its keyboard after a state-driven render.
+    setDirectInputMode(true);
+    setDirectInputValue('');
+    commandInputRef.current?.focus({ preventScroll: true });
+  };
+
+  const handleInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+    if (!directInputMode) {
+      setCommand(event.currentTarget.value);
+      historyIdxRef.current = -1;
+      return;
+    }
+
+    const inputEvent = event.nativeEvent as InputEvent;
+    const value = event.currentTarget.value;
+    if (inputEvent.isComposing) {
+      // Keep the in-progress value so terminal refreshes do not cancel iOS
+      // composition (accented characters, dictation, and non-Latin input).
+      setDirectInputValue(value);
+      return;
+    }
+
+    if (value) sendSpecialKey(value);
+    setDirectInputValue('');
+  };
+
+  const handleInputKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    if (!directInputMode) {
+      if (event.key === 'Enter') handleSend();
+      else if (event.key === 'ArrowUp') { event.preventDefault(); handleHistoryNav('up'); }
+      else if (event.key === 'ArrowDown') { event.preventDefault(); handleHistoryNav('down'); }
+      return;
+    }
+
+    if (event.nativeEvent.isComposing) return;
+    const keys = DIRECT_INPUT_KEYS[event.key];
+    if (!keys) return;
+    event.preventDefault();
+    sendSpecialKey(keys);
+    setDirectInputValue('');
   };
 
   const handlePaste = async () => {
@@ -1156,7 +1220,7 @@ export default function App() {
             className="flex-1 overflow-auto relative min-h-0 min-w-0"
           >
             {content && content.lines.length ? (
-              <pre className="p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full" style={{ color: content.fg, backgroundColor: content.bg }}>
+              <pre className="terminal-output p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full" style={{ color: content.fg, backgroundColor: content.bg }}>
                 {content.lines.map((runs, i) => (
                   <span key={i}>
                     {runs.map((r, j) => (
@@ -1282,7 +1346,7 @@ export default function App() {
               style={{ borderLeft: `3px solid ${focusedPane === 'split' ? '#38bdf8' : '#38bdf830'}` }}
             >
               {splitContent && splitContent.lines.length ? (
-                <pre className="p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full" style={{ color: splitContent.fg, backgroundColor: splitContent.bg }}>
+                <pre className="terminal-output p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full" style={{ color: splitContent.fg, backgroundColor: splitContent.bg }}>
                   {splitContent.lines.map((runs, i) => (
                     <span key={i}>
                       {runs.map((r, j) => (
@@ -1357,45 +1421,58 @@ export default function App() {
         <QuickBtn icon={<Trash2 className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x15')} color="#fb7185" />
       </div>
 
-      {/* ── Command Input / Virtual Keyboard ── */}
+      {/* ── Buffered command / native direct input ── */}
       <div className={`bg-zinc-950/90 border-t border-zinc-800/60 flex-shrink-0 ${isLandscape ? 'p-1.5' : 'p-3'}`}>
-        {keyboardMode ? (
-          <VirtualKeyboard
-            onKey={(key) => sendSpecialKey(key)}
-            onExit={() => setKeyboardMode(false)}
-          />
-        ) : (
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setKeyboardMode(true)}
-              className="w-10 h-10 flex items-center justify-center rounded-xl border border-zinc-700/50 transition-all active:scale-90 flex-shrink-0"
-              style={{ color: '#a78bfa', backgroundColor: '#a78bfa10' }}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={toggleDirectInput}
+            className="w-10 h-10 flex items-center justify-center rounded-xl border transition-all active:scale-90 flex-shrink-0"
+            style={{
+              color: directInputMode ? '#09090b' : '#a78bfa',
+              backgroundColor: directInputMode ? '#a78bfa' : '#a78bfa10',
+              borderColor: directInputMode ? '#a78bfa' : '#3f3f46',
+            }}
+            aria-label={directInputMode ? 'Exit direct terminal input' : 'Use iOS keyboard for direct terminal input'}
+            title={directInputMode ? 'Exit direct input' : 'Direct terminal input'}
+          >
+            {directInputMode ? <Terminal className="w-4 h-4" /> : <Keyboard className="w-4 h-4" />}
+          </button>
+          <div
+            className="flex-1 flex items-center gap-2 bg-zinc-900/60 border rounded-2xl pl-4 pr-1.5 py-1 transition-colors"
+            style={{
+              borderColor: directInputMode
+                ? '#a78bfa80'
+                : broadcastMode
+                  ? BROADCAST_COLOR + '50'
+                  : command.trim() ? ACCENT + '50' : '#27272a',
+            }}
+          >
+            <span
+              className="text-[14px] font-bold flex-shrink-0"
+              style={{ color: directInputMode ? '#a78bfa' : broadcastMode ? BROADCAST_COLOR : ACCENT }}
             >
-              <Keyboard className="w-4 h-4" />
-            </button>
-            <div
-              className="flex-1 flex items-center gap-2 bg-zinc-900/60 border rounded-2xl pl-4 pr-1.5 py-1 transition-colors"
-              style={{ borderColor: broadcastMode ? BROADCAST_COLOR + '50' : command.trim() ? ACCENT + '50' : '#27272a' }}
-            >
-              <span className="text-[14px] font-bold flex-shrink-0" style={{ color: broadcastMode ? BROADCAST_COLOR : ACCENT }}>
-                {broadcastMode ? '>' : '$'}
+              {directInputMode ? '›' : broadcastMode ? '>' : '$'}
+            </span>
+            <input
+              ref={commandInputRef}
+              type="text"
+              className="flex-1 bg-transparent border-none outline-none text-[16px] text-zinc-100 placeholder:text-zinc-700 font-mono min-h-[42px] min-w-0"
+              aria-label={directInputMode ? 'Direct terminal input' : 'Command'}
+              placeholder={directInputMode ? 'type directly to terminal…' : broadcastMode ? `broadcast to ${broadcastTargets.size}...` : 'command...'}
+              value={directInputMode ? directInputValue : command}
+              onChange={handleInputChange}
+              onKeyDown={handleInputKeyDown}
+              enterKeyHint={directInputMode ? 'enter' : 'send'}
+              autoCapitalize="none"
+              autoComplete="off"
+              autoCorrect="off"
+              spellCheck={false}
+            />
+            {directInputMode ? (
+              <span className="px-2 text-[9px] font-bold tracking-[0.16em] text-violet-400 flex-shrink-0">
+                LIVE
               </span>
-              <input
-                type="text"
-                className="flex-1 bg-transparent border-none outline-none text-[14px] text-zinc-100 placeholder:text-zinc-700 font-mono min-h-[42px]"
-                placeholder={broadcastMode ? `broadcast to ${broadcastTargets.size}...` : 'command...'}
-                value={command}
-                onChange={(e) => { setCommand(e.target.value); historyIdxRef.current = -1; }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter') handleSend();
-                  else if (e.key === 'ArrowUp') { e.preventDefault(); handleHistoryNav('up'); }
-                  else if (e.key === 'ArrowDown') { e.preventDefault(); handleHistoryNav('down'); }
-                }}
-                enterKeyHint="send"
-                autoCapitalize="off"
-                autoCorrect="off"
-                spellCheck={false}
-              />
+            ) : (
               <button
                 onClick={handleSend}
                 disabled={!command.trim() || !connected}
@@ -1408,9 +1485,9 @@ export default function App() {
               >
                 <Send className="w-4 h-4" />
               </button>
-            </div>
+            )}
           </div>
-        )}
+        </div>
       </div>
 
       <style>{`
@@ -1587,158 +1664,5 @@ function QuickBtn({ label, icon, onClick, color }: {
     >
       {icon || <span className="text-[11px] font-bold tracking-wide">{label}</span>}
     </button>
-  );
-}
-
-// --- Virtual Keyboard ---
-const KB_ALPHA = [
-  ['q','w','e','r','t','y','u','i','o','p'],
-  ['a','s','d','f','g','h','j','k','l'],
-  ['z','x','c','v','b','n','m'],
-];
-// Terminal essentials: numbers, paths, pipes, flags, redirects
-const KB_SYM = [
-  ['1','2','3','4','5','6','7','8','9','0'],
-  ['-','/','.','_','~','*','$','|','>','<'],
-  ['&',';','=','"',"'",'\\','`','#'],
-];
-// Brackets, operators, extras
-const KB_SYM2 = [
-  ['!','@','%','^','+','=','?',':'],
-  ['(',')','[',']','{','}','<','>'],
-  [',',';','"',"'",'`','~','\\','_'],
-];
-// Arrow cluster — sends real ANSI cursor-movement sequences (ESC [ A/B/C/D)
-const KB_ARROWS: { seq: string; Icon: typeof ChevronUp; label: string }[] = [
-  { seq: '\x1b[D', Icon: ChevronLeft, label: 'left' },
-  { seq: '\x1b[A', Icon: ChevronUp, label: 'up' },
-  { seq: '\x1b[B', Icon: ChevronDown, label: 'down' },
-  { seq: '\x1b[C', Icon: ChevronRight, label: 'right' },
-];
-
-function VirtualKeyboard({ onKey, onExit }: { onKey: (key: string) => void; onExit: () => void }) {
-  const [shift, setShift] = useState(false);
-  const [mode, setMode] = useState<'abc' | 'sym' | 'sym2'>('abc');
-
-  const rows = mode === 'abc' ? KB_ALPHA : mode === 'sym' ? KB_SYM : KB_SYM2;
-
-  const send = (ch: string) => {
-    if (mode === 'abc') {
-      onKey(shift ? ch.toUpperCase() : ch);
-      if (shift) setShift(false);
-    } else {
-      onKey(ch);
-    }
-  };
-
-  return (
-    <div className="flex flex-col gap-1.5">
-      {rows.map((row, ri) => (
-        <div
-          key={ri}
-          className={`flex gap-1 ${ri === 0 ? 'w-full' : ri === 1 ? 'mx-[4%]' : 'mx-[10%]'}`}
-        >
-          {row.map((ch, ci) => (
-            <button
-              key={`${ri}-${ci}`}
-              onClick={() => send(ch)}
-              className="flex min-w-0 flex-1 items-center justify-center h-[42px] rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[14px] font-semibold text-zinc-200 transition-all active:scale-90 active:bg-zinc-700"
-            >
-              {mode === 'abc' && shift ? ch.toUpperCase() : ch}
-            </button>
-          ))}
-        </div>
-      ))}
-      <div className="flex w-full gap-1">
-        {mode === 'abc' ? (
-          <button
-            onClick={() => setShift(!shift)}
-            className="flex basis-[18%] items-center justify-center h-[38px] rounded-md border text-[11px] font-bold transition-all active:scale-90"
-            style={{
-              borderColor: shift ? ACCENT : '#3f3f46',
-              backgroundColor: shift ? ACCENT + '25' : '#27272a',
-              color: shift ? ACCENT : '#a1a1aa',
-            }}
-          >
-            SHIFT
-          </button>
-        ) : (
-          <button
-            onClick={() => setMode(mode === 'sym' ? 'sym2' : 'sym')}
-            className="flex basis-[18%] items-center justify-center h-[38px] rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[10px] font-bold text-zinc-400 transition-all active:scale-90"
-          >
-            {mode === 'sym' ? '#+=' : '123'}
-          </button>
-        )}
-        {KB_ARROWS.map(({ seq, Icon, label }) => (
-          <button
-            key={label}
-            aria-label={label}
-            onClick={() => onKey(seq)}
-            className="flex-1 flex items-center justify-center h-[38px] rounded-md border border-zinc-700/50 bg-zinc-800/60 transition-all active:scale-90 active:bg-zinc-700"
-            style={{ color: '#a78bfa' }}
-          >
-            <Icon className="w-4 h-4" />
-          </button>
-        ))}
-        <button
-          onClick={() => onKey('\x7f')}
-          className="flex basis-[18%] items-center justify-center h-[38px] rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[11px] font-bold text-zinc-400 transition-all active:scale-90 active:bg-zinc-700"
-        >
-          DEL
-        </button>
-      </div>
-      <div className="flex justify-center gap-1">
-        <button
-          onClick={onExit}
-          className="flex items-center justify-center h-[38px] px-3 rounded-md border border-zinc-700/50 bg-zinc-800/60 transition-all active:scale-90"
-          style={{ color: '#a78bfa' }}
-        >
-          <Terminal className="w-4 h-4" />
-        </button>
-        <button
-          onClick={() => { setMode(mode === 'abc' ? 'sym' : 'abc'); setShift(false); }}
-          className="flex items-center justify-center h-[38px] px-3 rounded-md border text-[11px] font-bold transition-all active:scale-90"
-          style={{
-            borderColor: mode !== 'abc' ? '#818cf8' + '50' : '#3f3f46',
-            backgroundColor: mode !== 'abc' ? '#818cf8' + '15' : '#27272a',
-            color: mode !== 'abc' ? '#818cf8' : '#a1a1aa',
-          }}
-        >
-          {mode === 'abc' ? '123' : 'ABC'}
-        </button>
-        <button
-          onClick={() => onKey('-')}
-          className="flex items-center justify-center w-[30px] h-[38px] rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[13px] font-semibold text-zinc-200 transition-all active:scale-90"
-        >-</button>
-        <button
-          onClick={() => onKey(' ')}
-          className="flex-1 flex items-center justify-center h-[38px] rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[11px] font-bold text-zinc-400 transition-all active:scale-90"
-        >
-          SPACE
-        </button>
-        <button
-          onClick={() => onKey('.')}
-          className="flex items-center justify-center w-[30px] h-[38px] rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[13px] font-semibold text-zinc-200 transition-all active:scale-90"
-        >.</button>
-        {/* Newline (LF, 0x0A) — Shift+Enter equivalent: inserts a line without submitting */}
-        <button
-          onClick={() => onKey('\n')}
-          aria-label="newline"
-          className="flex items-center justify-center h-[38px] px-3 rounded-md border border-zinc-700/50 bg-zinc-800/60 text-[13px] font-bold text-zinc-300 transition-all active:scale-90 active:bg-zinc-700"
-        >
-          ⇧↵
-        </button>
-        {/* Real Return (CR, 0x0D) — submits in shells AND raw-mode TUIs like Claude Code */}
-        <button
-          onClick={() => onKey('\r')}
-          aria-label="return"
-          className="flex items-center justify-center h-[38px] px-4 rounded-md border transition-all active:scale-90"
-          style={{ borderColor: ACCENT + '50', backgroundColor: ACCENT + '15', color: ACCENT }}
-        >
-          <CornerDownLeft className="w-4 h-4" />
-        </button>
-      </div>
-    </div>
   );
 }

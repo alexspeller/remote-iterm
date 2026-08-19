@@ -18,6 +18,13 @@ body {
   height: 100%;
 }
 
+.terminal-output,
+.terminal-output * {
+  -webkit-touch-callout: default;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
 * {
   box-sizing: border-box;
 }
