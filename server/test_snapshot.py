@@ -93,9 +93,11 @@ class SessionArchiveTest(unittest.TestCase):
          S.LOG_PATH, S.SNAPSHOT_DIR) = self._orig
         self._tmp.cleanup()
 
-    def _write_latest(self, captured):
+    def _write_latest(self, captured, windows=None):
+        if windows is None:
+            windows = [{"id": "w1", "tabs": [{"index": 1, "panes": [{"id": "p:A"}]}]}]
         (S.LATEST_DIR / "state.json").write_text(
-            json.dumps({"capturedAt": captured, "windows": []}))
+            json.dumps({"capturedAt": captured, "windows": windows}))
         (S.LATEST_DIR / "panes" / "p_A.txt").write_text("scrollback here\n")
 
     def test_archive_preserves_latest_with_content(self):
@@ -130,6 +132,30 @@ class SessionArchiveTest(unittest.TestCase):
     def test_no_latest_no_archive(self):
         S.Snapshotter(None, None)._archive_previous_session()  # no state.json
         self.assertEqual(S.session_archives(), [])
+
+    def test_empty_latest_is_not_archived(self):
+        # A graceful iTerm quit tears windows down while the snapshotter is still
+        # alive, leaving an empty `latest/`. Archiving that would erase the
+        # recoverable session — so it must be refused.
+        self._write_latest("2026-08-20T14:19:02+00:00", windows=[])
+        S.Snapshotter(None, None)._archive_previous_session()
+        self.assertEqual(S.session_archives(), [])
+
+    def test_existing_empty_archive_is_pruned_and_hidden(self):
+        # A real session, then a bug-artifact empty archive already on disk.
+        self._write_latest("2026-08-20T11:00:00+00:00")
+        S.Snapshotter(None, None)._archive_previous_session()
+        empty = S.SESSIONS_DIR / "2026-08-20T14_19_02_00_00"
+        (empty / "panes").mkdir(parents=True)
+        (empty / "state.json").write_text(
+            json.dumps({"capturedAt": "2026-08-20T14:19:02+00:00", "windows": []}))
+        # Never offered as restorable...
+        names = [d.name for d in S.session_archives()]
+        self.assertNotIn("2026-08-20T14_19_02_00_00", names)
+        self.assertEqual(len(names), 1)
+        # ...and physically removed on the next prune.
+        S._prune_sessions()
+        self.assertFalse(empty.exists())
 
 
 class HistoryFsTest(unittest.TestCase):

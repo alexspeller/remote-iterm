@@ -47,11 +47,36 @@ def clean_title(title) -> str:
 
 # --- live replay ---------------------------------------------------------------
 
+# A bare login shell sitting at its prompt isn't a "running command" worth
+# echoing; "was running: -fish" is noise. Both the foreground job name (e.g.
+# "fish") and iTerm's recorded command line (e.g. "-fish") show up shell-shaped.
+_SHELLS = {"fish", "-fish", "bash", "-bash", "zsh", "-zsh", "sh", "-sh",
+           "dash", "-dash", "tcsh", "-tcsh", "csh", "-csh",
+           "login", "-login", "screen", "tmux"}
+
+
+def running_command(meta) -> str:
+    """The command that was running in a pane, for restore's echo.
+
+    Prefers iTerm's full recorded command line (``cmd``, e.g. the whole
+    ``node …/reminders-today.ts``) and falls back to the foreground job name
+    (``job``) when no command line was captured. Returns "" for a pane that was
+    just a shell prompt, so restore doesn't print a meaningless banner.
+    """
+    cmd = (meta.get("cmd") or "").strip()
+    if cmd and cmd not in _SHELLS:
+        return cmd
+    job = (meta.get("job") or "").strip()
+    if job and job not in _SHELLS:
+        return job
+    return ""
+
+
 async def _configure(session, meta, content_dir) -> None:
     if not meta:
         return
     cwd = meta.get("cwd") or ""
-    cmd = meta.get("cmd") or meta.get("job") or ""
+    cmd = running_command(meta)
     content = ""
     ref = meta.get("contentFile")
     if ref and content_dir is not None:
@@ -67,7 +92,11 @@ async def _configure(session, meta, content_dir) -> None:
         parts.append("\r\n\x1b[2m─── restored pane · previous output ───\x1b[0m\r\n")
         parts.append(content.replace("\r\n", "\n").replace("\n", "\r\n"))
     if cmd:
-        parts.append(f"\r\n\x1b[2m─── was running: {cmd} ───\x1b[0m\r\n")
+        # Bold, on its own line, with no trailing box rule — a long command line
+        # then wraps cleanly instead of orphaning "───" onto the next row. This
+        # is the last thing injected, so it sits right above the fresh prompt.
+        lead = "\r\n" if content else ""
+        parts.append(f"{lead}\x1b[1;33m▶ was running:\x1b[0m \x1b[1m{cmd}\x1b[0m\r\n")
     if parts:
         try:
             await session.async_inject("".join(parts).encode("utf-8", "replace"))

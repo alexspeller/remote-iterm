@@ -102,6 +102,8 @@ remote-iterm continuously records your full iTerm2 layout so you can recover it 
 
 **Surviving a crash.** The catch a naïve snapshotter would hit: when you reopen iTerm2 after a crash, the snapshotter starts capturing the *new* (blank) session and would overwrite the good one. To avoid that, at startup — **before** it captures anything — the snapshotter archives the outgoing `latest/` (with its content) into `sessions/<timestamp>/`. So the pre-crash session is preserved intact, and `iterm-snapshot restore` defaults to **that last completed session**, not the blank one you just opened. The last 20 sessions (within 14 days) are kept.
 
+**Surviving a graceful quit.** A crash is the easy case — iTerm2 dies instantly, so `latest/` still holds your full layout. A normal **Quit** is trickier: iTerm2 closes its windows a moment before the snapshotter shuts down, so an unguarded snapshotter would capture an *empty* layout and archive that instead of your session. The snapshotter refuses to overwrite `latest/` with a zero-window snapshot (and refuses to archive an empty one), so quitting iTerm2 the normal way preserves your session just like a crash does.
+
 Use the `iterm-snapshot` CLI:
 
 ```bash
@@ -117,7 +119,7 @@ iterm-snapshot install              # auto-start remote-iterm whenever iTerm2 la
 
 So the crash-recovery flow is simply: reopen iTerm2, run `iterm-snapshot restore`.
 
-Restore recreates each window/tab/split, `cd`s every pane back to its directory, restores custom tab titles and each pane's custom initial working directory (so a `🧰 <project>` tab keeps its label *and* new splits still open in the project dir), and **echoes** the pane's previous output above a fresh prompt — it can't revive the running process, but you see what was there and the command that was running. It never touches your existing windows; split proportions are approximate.
+Restore recreates each window/tab/split, `cd`s every pane back to its directory, restores custom tab titles and each pane's custom initial working directory (so a `🧰 <project>` tab keeps its label *and* new splits still open in the project dir), and **echoes** the pane's previous output above a fresh prompt — then prints the full command that was running (e.g. `node …/reminders-today.ts`) on its own highlighted line. It can't revive the process, but you see what was there and exactly what it was running. It never touches your existing windows; split proportions are approximate.
 
 `iterm-snapshot install` symlinks an AutoLaunch supervisor into iTerm2's scripts folder so the server, web client, and snapshotter all start automatically with iTerm2 and stop when it quits — no need to remember to launch anything.
 

@@ -1,6 +1,7 @@
 import unittest
 
-from server.restore import clean_title, pane_ids, plan_text, split_count
+from server.restore import (clean_title, pane_ids, plan_text,
+                            running_command, split_count)
 
 PANE = lambda i: {"type": "pane", "id": i}  # noqa: E731
 
@@ -34,6 +35,24 @@ class RestorePureTest(unittest.TestCase):
         self.assertEqual(clean_title("🔔 🔔 x"), "x")
         self.assertEqual(clean_title(""), "")
         self.assertEqual(clean_title(None), "")
+
+    def test_running_command_prefers_full_command_line(self):
+        # The full command line, not just the job name, is what restore echoes.
+        meta = {"cmd": "node /Users/alex/projects/mailai/src/scripts/reminders.ts",
+                "job": "node"}
+        self.assertEqual(running_command(meta),
+                         "node /Users/alex/projects/mailai/src/scripts/reminders.ts")
+
+    def test_running_command_falls_back_to_job(self):
+        # No command line captured (e.g. no shell integration) -> show the job.
+        self.assertEqual(running_command({"cmd": "", "job": "python3.11"}),
+                         "python3.11")
+
+    def test_running_command_skips_bare_shell(self):
+        # A pane that was just a shell prompt has no meaningful running command.
+        self.assertEqual(running_command({"cmd": "-fish", "job": "fish"}), "")
+        self.assertEqual(running_command({"cmd": "", "job": "-zsh"}), "")
+        self.assertEqual(running_command({"cmd": "", "job": ""}), "")
 
     def test_plan_text_lists_panes(self):
         snap = {"windows": [{"tabs": [{

@@ -346,9 +346,16 @@ class Snapshotter:
         if not state.exists():
             return
         try:
-            captured = json.loads(state.read_text()).get("capturedAt", "")
+            data = json.loads(state.read_text())
         except Exception:
-            captured = ""
+            data = {}
+        if not data.get("windows"):
+            # Defense in depth: never archive an empty `latest/` as a "previous
+            # session" (see the snapshot() guard). Nothing to recover from it.
+            log("skipped archiving empty previous session")
+            _prune_sessions()
+            return
+        captured = data.get("capturedAt", "")
         stamp = _safe_id(captured) if captured else "unknown"
         dest = SESSIONS_DIR / stamp
         if dest.exists():
@@ -381,6 +388,16 @@ class Snapshotter:
     async def snapshot(self) -> None:
         try:
             snap = await self.build()
+            if not snap["windows"]:
+                # Zero terminal windows means iTerm is quitting (graceful quit
+                # tears windows down while this process is still alive) or every
+                # window was closed. Do NOT overwrite the last good `latest/`
+                # with an empty snapshot: that erases the recoverable session and
+                # then gets archived as a blank "previous session" on reopen. A
+                # crash, by contrast, kills iTerm instantly with no teardown
+                # notification, so `latest/` correctly retains the pre-crash state.
+                log("skipped empty snapshot (0 windows — iTerm quitting/closed)")
+                return
             clean = self._write_latest(snap)
             self._append_history(clean)
         except Exception:
@@ -526,18 +543,38 @@ def _prune_history() -> None:
                 pass
 
 
+def _archive_is_empty(d: Path) -> bool:
+    """A session archive with no windows carries nothing to restore (a teardown
+    snapshot that slipped through). Unreadable archives count as empty too."""
+    try:
+        return not json.loads((d / "state.json").read_text()).get("windows")
+    except Exception:
+        return True
+
+
 def session_archives() -> list:
-    """Session-archive dirs, newest first. Names are _safe_id(capturedAt), which
-    sort chronologically, so lexical sort == chronological."""
+    """Restorable session-archive dirs, newest first. Empty (0-window) archives
+    are excluded so restore/list never offer a blank session. Names are
+    _safe_id(capturedAt), which sort chronologically, so lexical sort ==
+    chronological."""
     if not SESSIONS_DIR.exists():
         return []
     dirs = [d for d in SESSIONS_DIR.iterdir()
-            if d.is_dir() and not d.name.startswith(".tmp-")]
+            if d.is_dir() and not d.name.startswith(".tmp-")
+            and not _archive_is_empty(d)]
     return sorted(dirs, key=lambda d: d.name, reverse=True)
 
 
 def _prune_sessions() -> None:
-    archives = session_archives()
+    if not SESSIONS_DIR.exists():
+        return
+    # First delete bug-artifact empties (e.g. a graceful-quit teardown snapshot
+    # archived before the empty-snapshot guards existed).
+    for d in SESSIONS_DIR.iterdir():
+        if (d.is_dir() and not d.name.startswith(".tmp-")
+                and _archive_is_empty(d)):
+            shutil.rmtree(d, ignore_errors=True)
+    archives = session_archives()  # non-empty only
     today = date.today()
     for i, d in enumerate(archives):
         too_many = i >= MAX_SESSION_ARCHIVES
