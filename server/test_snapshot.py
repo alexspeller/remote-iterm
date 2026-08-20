@@ -21,6 +21,7 @@ def make_clean(cwd="/Users/x/proj", captured="2026-08-19T10:00:00+00:00"):
                 "layout": "┌┐\n└┘",
                 "panes": [{
                     "id": "p:A", "name": "fish", "cwd": cwd, "job": "vim",
+                    "customDir": "/Users/x/proj",
                     "cmd": "vim file", "cols": 80, "rows": 24,
                     "rect": {"x": 0, "y": 0, "w": 1, "h": 1},
                     "contentFile": "panes/p_A.txt", "contentLines": 3,
@@ -47,6 +48,7 @@ class HelperTest(unittest.TestCase):
         self.assertNotIn("contentLines", pane)
         self.assertNotIn("_content", pane)
         self.assertIn("cwd", pane)
+        self.assertEqual(pane["customDir"], "/Users/x/proj")  # kept for restore
         self.assertIn("tree", rec["windows"][0]["tabs"][0])
         self.assertIn("layout", rec["windows"][0]["tabs"][0])
 

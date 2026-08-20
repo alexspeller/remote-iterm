@@ -137,6 +137,9 @@ class Snapshotter:
         # session_id -> (monotonic_ts, text) so rapid triggers don't re-read all
         # panes; the heartbeat keeps them fresh.
         self.content_cache: dict[str, tuple[float, str]] = {}
+        # session_id -> profile custom initial directory ("" if not custom). Read
+        # once; a profile's working-directory setting doesn't change per session.
+        self.custom_dir_cache: dict[str, str] = {}
         self.last_history_key: str | None = None
 
     # --- content -----------------------------------------------------------
@@ -168,6 +171,26 @@ class Snapshotter:
         self.content_cache[session.session_id] = (now, text)
         return text
 
+    async def _custom_dir(self, session) -> str:
+        """The pane's profile custom initial directory (e.g. a ~/bin/project
+        tab), or "" if the profile isn't in custom-directory mode. Restore
+        reapplies this so splitting a restored pane opens in the same place."""
+        sid = session.session_id
+        if sid in self.custom_dir_cache:
+            return self.custom_dir_cache[sid]
+        custom = ""
+        try:
+            profile = await session.async_get_profile()
+            mode = profile.initial_directory_mode
+            custom_value = iterm2.profile.InitialWorkingDirectory. \
+                INITIAL_WORKING_DIRECTORY_CUSTOM.value
+            if getattr(mode, "value", mode) == custom_value:
+                custom = profile.custom_directory or ""
+        except Exception:
+            custom = ""
+        self.custom_dir_cache[sid] = custom
+        return custom
+
     # --- snapshot build ----------------------------------------------------
 
     async def _pane_entry(self, session, rect) -> dict:
@@ -190,6 +213,7 @@ class Snapshotter:
             "id": session.session_id,
             "name": session.name or "",
             "cwd": cwd,
+            "customDir": await self._custom_dir(session),
             "job": job,
             "cmd": cmd,
             "cols": cols,
@@ -415,6 +439,7 @@ def _history_record(clean: dict) -> dict:
         tabs = []
         for tab in window["tabs"]:
             panes = [{"id": p["id"], "name": p["name"], "cwd": p["cwd"],
+                      "customDir": p.get("customDir", ""),
                       "job": p["job"], "cmd": p["cmd"], "rect": p["rect"]}
                      for p in tab["panes"]]
             tabs.append({

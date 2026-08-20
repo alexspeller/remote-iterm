@@ -77,6 +77,21 @@ async def _configure(session, meta, content_dir) -> None:
         # CR (\r), not LF: a real Return submits in the shell.
         await session.async_send_text("cd " + shlex.quote(cwd) + "\r")
 
+    # Reapply a custom initial directory (e.g. a ~/bin/project tab) to the
+    # session's profile, so splitting the restored pane opens in the same
+    # place — matching the profile state the project launcher created.
+    custom = meta.get("customDir") or ""
+    if custom:
+        try:
+            props = iterm2.LocalWriteOnlyProfile()
+            props.set_initial_directory_mode(
+                iterm2.profile.InitialWorkingDirectory
+                .INITIAL_WORKING_DIRECTORY_CUSTOM)
+            props.set_custom_directory(custom)
+            await session.async_set_profile_properties(props)
+        except Exception:
+            pass
+
 
 async def _realize(node, session, meta_by_id, content_dir) -> None:
     if node.get("type") == "pane":
