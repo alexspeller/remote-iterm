@@ -642,9 +642,30 @@ async def on_watch(sid, data):
     # The client lists the sessions it is currently viewing (main + split panes);
     # we live-stream exactly that union across all clients.
     ids = data.get("sessionIds") or []
-    watched_by_sid[sid] = {
+    sessions = {
         s for s in ids[:MAX_WATCHED_SESSIONS] if s and s != "undefined"
     }
+    watched_by_sid[sid] = sessions
+
+    # Immediately hand this client a snapshot of any pane that is *already* being
+    # streamed for another connection. A shared per-session stream emits its first
+    # frame only when its task is created (see stream_session), so a client that
+    # starts watching an already-streamed pane — e.g. a phone reconnecting after
+    # sleep while its previous connection's stream is still alive — would
+    # otherwise sit on "WAITING FOR OUTPUT" until that pane next changes. Panes
+    # not yet streamed are covered by the initial read in stream_session(), which
+    # apply_watches() starts below, so only pre-existing streams are seeded here.
+    for session_id in sessions:
+        if session_id not in stream_tasks:
+            continue
+        content = last_content.get(session_id)
+        if content is None:
+            content = await read_content(session_id)
+        if content and content["lines"]:
+            queue_client_event(
+                sid, f"content:{session_id}", "content",
+                {"sessionId": session_id, **content})
+
     await apply_watches()
 
 

@@ -7,9 +7,12 @@ from server.server import (
     _line_runs,
     clients,
     delivery_wakeups,
+    last_content,
+    on_watch,
     pending_events,
     queue_client_event,
     queue_content_for_watchers,
+    stream_tasks,
     watched_by_sid,
 )
 
@@ -113,6 +116,62 @@ class BoundedDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(pending_events["watching"]), 1)
         self.assertEqual(pending_events["other"], {})
+
+
+class InitialWatchSnapshotTest(unittest.IsolatedAsyncioTestCase):
+    """A client that starts watching a pane another connection is already
+    streaming must get an immediate content snapshot — not sit on WAITING FOR
+    OUTPUT until the pane next changes.
+    """
+
+    def _frame(self, text):
+        return {
+            "lines": [[{"t": text}]], "fg": "#fff", "bg": "#000",
+            "firstLine": 0, "availableFirstLine": 0, "terminalEnd": 1,
+            "isLatest": True,
+        }
+
+    async def asyncSetUp(self):
+        # A pane already being streamed for an existing connection, with a frame
+        # cached by that stream.
+        self._alive = asyncio.create_task(asyncio.Event().wait())  # never resolves
+        stream_tasks["session-1"] = self._alive
+        last_content["session-1"] = self._frame("hello")
+        # The freshly-connected client.
+        clients.add("late")
+        pending_events["late"] = {}
+        delivery_wakeups["late"] = asyncio.Event()
+
+    async def asyncTearDown(self):
+        self._alive.cancel()
+        await asyncio.gather(self._alive, return_exceptions=True)
+        for task in list(stream_tasks.values()):
+            task.cancel()
+        await asyncio.gather(*stream_tasks.values(), return_exceptions=True)
+        clients.clear()
+        watched_by_sid.clear()
+        pending_events.clear()
+        delivery_wakeups.clear()
+        stream_tasks.clear()
+        last_content.clear()
+
+    async def test_late_watcher_is_seeded_from_the_running_stream(self):
+        await on_watch("late", {"sessionIds": ["session-1"]})
+
+        self.assertIn("content:session-1", pending_events["late"])
+        event, payload = pending_events["late"]["content:session-1"]
+        self.assertEqual(event, "content")
+        self.assertEqual(payload["sessionId"], "session-1")
+        self.assertEqual(payload["lines"], [[{"t": "hello"}]])
+
+    async def test_unstreamed_pane_is_not_seeded_here(self):
+        # A pane with no existing stream is left to stream_session's own initial
+        # read (started by apply_watches), so on_watch must not pre-send it — that
+        # would double up with the stream's first frame.
+        await on_watch("late", {"sessionIds": ["session-2"]})
+        await asyncio.sleep(0)  # let apply_watches' no-op stream task settle
+
+        self.assertNotIn("content:session-2", pending_events["late"])
 
 
 if __name__ == "__main__":
