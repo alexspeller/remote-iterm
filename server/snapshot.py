@@ -25,6 +25,8 @@ import json
 import math
 import os
 import shutil
+import signal
+import sys
 import tempfile
 import time
 import traceback
@@ -32,6 +34,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 import iterm2
+import iterm2.rpc
 
 try:
     from .ascii_layout import render as render_ascii
@@ -57,11 +60,36 @@ TAIL_LINES = 200
 RETENTION_DAYS = 14
 MAX_SESSION_ARCHIVES = 20
 
-DEBOUNCE_SECONDS = 1.5      # coalesce a burst of change notifications
-MIN_INTERVAL_SECONDS = 4.0  # floor between successive snapshots
-HEARTBEAT_SECONDS = 30.0    # guarantee freshness + refresh content/cwd/job
-CONTENT_TTL_SECONDS = 8.0   # don't re-read a pane's content more often than this
+DEBOUNCE_SECONDS = 1.5       # coalesce a burst of change notifications
+MIN_INTERVAL_SECONDS = 10.0  # floor between successive snapshots
+HEARTBEAT_SECONDS = 30.0     # guarantee freshness + refresh content/cwd/job
+CONTENT_TTL_SECONDS = 30.0   # don't re-read a pane's content more often than this
 ASCII_COLS = 60
+# Pause between panes while building a snapshot. A full build costs ~5 RPCs
+# per pane, and iTerm2 answers them on its main thread — so on a busy Mac
+# with 30-odd panes an unpaced build monopolizes that thread for seconds and
+# stalls every other API client (including the phone server's own live
+# streaming). This is a background safety net, so trading ~1.5s of build time
+# for iTerm2 staying responsive throughout is the right way round.
+PANE_READ_DELAY = 0.05
+# Ceiling on one full build. A build issues ~5 RPCs per pane and the iterm2
+# library puts no timeout on any of them, so on a Mac slow enough to stall
+# iTerm2 for minutes a single build can outlive the session it is meant to
+# protect. Abandoning it and retrying costs one skipped snapshot; not
+# abandoning it costs every later snapshot, since the scheduler awaits this.
+# Safe to cancel mid-build precisely because _read_tail avoids
+# iterm2.Transaction (see the note there).
+SNAPSHOT_TIMEOUT_SECONDS = 300.0
+
+# How often the watchdog proves the iTerm2 connection is actually answering
+# RPCs (not just open), and how long it waits for one round trip. Same
+# rationale as server.py's identical constants: the iterm2 library never
+# reconnects mid-session, so a dead connection just hangs every future call
+# forever, silently.
+WATCHDOG_INTERVAL = 15.0
+WATCHDOG_TIMEOUT = 20.0
+WATCHDOG_RETRY_INTERVAL = 3.0
+WATCHDOG_FAILURES_BEFORE_RESTART = 10
 
 
 def log(msg: str) -> None:
@@ -111,6 +139,72 @@ def _grid_tree(ids: list[str]) -> dict:
     return {"type": "split", "vertical": False, "children": row_nodes}
 
 
+def _iterm_connection_dead(connection) -> bool:
+    """True only for a connection that can never answer again. See
+    server.py's identical helper for the full rationale — same underlying
+    library, same failure mode, independent connection."""
+    if connection is None:
+        return True
+    websocket = getattr(connection, "websocket", None)
+    if websocket is None:
+        return True
+    closed = getattr(websocket, "closed", None)
+    if closed is None:
+        closed = getattr(websocket, "close_code", None) is not None
+    if closed:
+        return True
+    dispatcher = getattr(connection, "_Connection__dispatch_forever_future", None)
+    return dispatcher is not None and dispatcher.done()
+
+
+async def connection_watchdog(connection, stop: asyncio.Event) -> None:
+    """Proves the iTerm2 connection is actually answering RPCs, not just
+    still open. See server.py's connection_watchdog for the full rationale —
+    same underlying library, same failure mode, independent connection.
+
+    Restarting here is not free either: startup archives the outgoing
+    `latest/` into `sessions/`, so a restart storm both churns the archive
+    and re-reads every pane, which is exactly the load that provokes the
+    next stall. So a slow probe only counts once the connection is either
+    provably dead or unresponsive several probes running.
+    """
+    failures = 0
+    while not stop.is_set():
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(
+                iterm2.rpc.async_list_sessions(connection),
+                timeout=WATCHDOG_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            failures += 1
+            elapsed = time.monotonic() - started
+            if _iterm_connection_dead(connection):
+                log(f"watchdog: iTerm2 connection is dead after {elapsed:.1f}s "
+                    f"({err!r}); restarting")
+                stop.set()
+                return
+            if failures >= WATCHDOG_FAILURES_BEFORE_RESTART:
+                log(f"watchdog: iTerm2 unresponsive for {failures} probes in a "
+                    f"row ({err!r}); restarting")
+                stop.set()
+                return
+            log(f"watchdog: iTerm2 probe timed out after {elapsed:.1f}s "
+                f"({failures}/{WATCHDOG_FAILURES_BEFORE_RESTART}) — connection "
+                "still open, so iTerm2 is busy rather than gone; waiting")
+        else:
+            if failures:
+                log(f"watchdog: iTerm2 answering again after {failures} slow "
+                    "probe(s)")
+            failures = 0
+        delay = WATCHDOG_RETRY_INTERVAL if failures else WATCHDOG_INTERVAL
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+
+
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=path.suffix)
@@ -146,16 +240,23 @@ class Snapshotter:
 
     async def _read_tail(self, session, n: int = TAIL_LINES) -> str:
         try:
-            async with iterm2.Transaction(self.connection):
-                info = await session.async_get_line_info()
-                available_first = info.overflow
-                terminal_end = (available_first + info.scrollback_buffer_height
-                                + info.mutable_area_height)
-                first = max(available_first, terminal_end - n)
-                count = terminal_end - first
-                if count <= 0:
-                    return ""
-                lines = await session.async_get_contents(first, count)
+            # Not wrapped in an iterm2.Transaction: a transaction blocks
+            # iTerm2's entire main thread until explicitly ended, and this
+            # read runs inside a cancelable task. Cancellation landing
+            # between the BEGIN and END RPCs strands the BEGIN and hangs
+            # iTerm2's whole GUI waiting on an END that never arrives.
+            # async_get_contents already tolerates the screen changing
+            # between these two calls by returning fewer lines than
+            # requested rather than raising.
+            info = await session.async_get_line_info()
+            available_first = info.overflow
+            terminal_end = (available_first + info.scrollback_buffer_height
+                            + info.mutable_area_height)
+            first = max(available_first, terminal_end - n)
+            count = terminal_end - first
+            if count <= 0:
+                return ""
+            lines = await session.async_get_contents(first, count)
             text = "\n".join(line.string.rstrip() for line in lines)
             return text.strip("\n")
         except Exception as err:
@@ -262,8 +363,11 @@ class Snapshotter:
                 ids = [s.session_id for s in tab.all_sessions]
                 tree = _grid_tree(ids)
 
-        panes = [await self._pane_entry(s, rects.get(s.session_id))
-                 for s in tab.all_sessions]
+        panes = []
+        for session in tab.all_sessions:
+            panes.append(
+                await self._pane_entry(session, rects.get(session.session_id)))
+            await asyncio.sleep(PANE_READ_DELAY)
         cur = tab.current_session
         return {
             "index": index,
@@ -387,7 +491,8 @@ class Snapshotter:
 
     async def snapshot(self) -> None:
         try:
-            snap = await self.build()
+            snap = await asyncio.wait_for(
+                self.build(), timeout=SNAPSHOT_TIMEOUT_SECONDS)
             if not snap["windows"]:
                 # Zero terminal windows means iTerm is quitting (graceful quit
                 # tears windows down while this process is still alive) or every
@@ -400,6 +505,9 @@ class Snapshotter:
                 return
             clean = self._write_latest(snap)
             self._append_history(clean)
+        except asyncio.TimeoutError:
+            log(f"snapshot abandoned after {SNAPSHOT_TIMEOUT_SECONDS:.0f}s — "
+                "iTerm2 too slow to answer; will retry")
         except Exception:
             log("snapshot failed:\n" + traceback.format_exc())
 
@@ -411,8 +519,17 @@ class Snapshotter:
             self.trigger.clear()
             await asyncio.sleep(DEBOUNCE_SECONDS)
             self.trigger.clear()
+            started = time.monotonic()
             await self.snapshot()
-            await asyncio.sleep(MIN_INTERVAL_SECONDS)
+            # Rest at least as long as the build took, so the snapshotter can
+            # never use more than about half of iTerm2's answering capacity.
+            # On a responsive Mac a build is far quicker than
+            # MIN_INTERVAL_SECONDS and this changes nothing; on a loaded one,
+            # where a build can run for minutes, it stops it from rebuilding
+            # back-to-back and becoming a good share of the very slowness it
+            # is struggling against.
+            elapsed = time.monotonic() - started
+            await asyncio.sleep(max(MIN_INTERVAL_SECONDS, elapsed))
 
     async def _heartbeat(self) -> None:
         while True:
@@ -438,13 +555,74 @@ class Snapshotter:
         # Preserve the previous session BEFORE the first snapshot overwrites it.
         self._archive_previous_session()
         log("snapshotter started")
-        await self.snapshot()  # capture immediately on startup
-        await asyncio.gather(
-            self._scheduler(),
-            self._heartbeat(),
-            self._layout_monitor(),
-            self._focus_monitor(),
-        )
+
+        # `stop` is shared by a real shutdown signal, connection_watchdog's
+        # periodic probe, and the exception handler below. Every background
+        # task here only matters while the connection is alive, so — unlike
+        # server.py, which has to spare narrowly-scoped per-client tasks —
+        # any unhandled exception anywhere is treated as a reason to restart.
+        stop = asyncio.Event()
+        signal_stop = False
+
+        def handle_asyncio_exception(loop, context) -> None:
+            exc = context.get("exception")
+            # An unretrieved Task exception (our actual failure mode: a
+            # fire-and-forget task dies and nothing ever awaits it) is
+            # reported via Future.__del__ using the 'future' key, not
+            # 'task' — only the unrelated "destroyed while pending"
+            # warning uses 'task'. Check both.
+            holder = context.get("task") or context.get("future")
+            coro = holder.get_coro() if hasattr(holder, "get_coro") else None
+            name = getattr(coro, "__qualname__", "") if coro is not None else ""
+            log(f"unhandled exception in {name or 'event loop'}: "
+                f"{context.get('message')}: {exc!r}")
+            if not stop.is_set():
+                stop.set()
+
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(handle_asyncio_exception)
+
+        def handle_signal() -> None:
+            nonlocal signal_stop
+            signal_stop = True
+            log("received stop signal")
+            stop.set()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, handle_signal)
+            except (NotImplementedError, RuntimeError):
+                pass
+
+        tasks = [
+            asyncio.create_task(self._scheduler()),
+            asyncio.create_task(self._heartbeat()),
+            asyncio.create_task(self._layout_monitor()),
+            asyncio.create_task(self._focus_monitor()),
+            asyncio.create_task(connection_watchdog(self.connection, stop)),
+        ]
+        # Capture immediately — but only now that the scheduler and the
+        # connection watchdog above are running. Doing it inline before this
+        # point meant the very first build, which is unbounded and on a busy
+        # Mac can take minutes, ran with nothing alive to time it out, retry
+        # it, or notice it had wedged: the process then sat at 0% CPU
+        # producing no snapshots, and the AutoLaunch supervisor kept it that
+        # way because its PID was still perfectly alive.
+        self.trigger.set()
+        await stop.wait()
+        if not signal_stop:
+            log("shutting down for a supervised restart")
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        # Must exit explicitly rather than just returning: iterm2.run_forever
+        # awaits its own internal dispatch-forever task *after* this coro
+        # returns (see Connection.run's async_main), and that task only ends
+        # when the websocket itself closes — which we never do. Returning
+        # normally would hang the process forever instead of exiting, which
+        # defeats the whole point of a supervised restart (and, worse, means
+        # SIGTERM from `iterm-server stop` would no longer actually stop it).
+        sys.exit(0 if signal_stop else 1)
 
 
 # --- rendering (shared with the CLI) -------------------------------------------
