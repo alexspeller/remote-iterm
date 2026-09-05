@@ -1,6 +1,6 @@
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, memo } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { Plus, X, Send, Clock, ChevronUp, ChevronDown, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, LayoutGrid, List as ListIcon, KeyRound } from 'lucide-react';
+import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, Rows2, LayoutGrid, List as ListIcon, KeyRound, ScrollText, SpellCheck2 } from 'lucide-react';
 
 // --- Types ---
 interface PaneRect { x: number; y: number; w: number; h: number; }
@@ -33,7 +33,10 @@ const SOCKET_URL = window.location.hostname === 'localhost'
 
 const HISTORY_KEY = 'iterm-cmd-history';
 const ACCESS_KEY_STORAGE_KEY = 'remote-iterm-access-key';
+const SMART_TYPING_KEY = 'remote-iterm-smart-typing';
+const TYPING_LOG_KEY = 'remote-iterm-typing-log';
 const MAX_HISTORY = 100;
+const MAX_TYPING_LOG_CHARS = 20000;
 const BOTTOM_THRESHOLD_PX = 4;
 const DIRECT_INPUT_KEYS: Record<string, string> = {
   Enter: '\r',
@@ -64,6 +67,34 @@ function rememberAccessKey(key: string) {
   try { localStorage.setItem(ACCESS_KEY_STORAGE_KEY, key); } catch {}
   const hash = new URLSearchParams({ key }).toString();
   window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${hash}`);
+}
+
+// Off by default, matching prior behavior — this only ever loosens the
+// buffered command box; direct/live input always forces these off (see the
+// input's props below), since autocorrecting mid-keystroke would corrupt
+// whatever is being typed character-by-character into the terminal.
+function loadSmartTyping(): boolean {
+  try { return localStorage.getItem(SMART_TYPING_KEY) === '1'; } catch { return false; }
+}
+
+function loadTypingLog(): string {
+  try { return localStorage.getItem(TYPING_LOG_KEY) || ''; } catch { return ''; }
+}
+
+// A single rolling string rather than an array of entries: a buffered
+// command is a complete unit and starts its own line, while direct-input
+// text arrives one keystroke (or IME commit) at a time and should
+// concatenate onto the current line exactly as it was typed.
+function appendTypingLog(current: string, text: string, newLine: boolean): string {
+  if (!text) return current;
+  let next = !current || newLine ? (current ? `${current}\n${text}` : text) : current + text;
+  if (next.length > MAX_TYPING_LOG_CHARS) {
+    next = next.slice(next.length - MAX_TYPING_LOG_CHARS);
+    // Land on a clean line boundary instead of a chopped-off first line.
+    const firstBreak = next.indexOf('\n');
+    if (firstBreak !== -1) next = next.slice(firstBreak + 1);
+  }
+  return next;
 }
 
 function mergeStyledContent(current: StyledContent | undefined, incoming: StyledContent): StyledContent {
@@ -135,6 +166,9 @@ export default function App() {
   const [command, setCommand] = useState('');
   const [directInputMode, setDirectInputMode] = useState(false);
   const [directInputValue, setDirectInputValue] = useState('');
+  const [smartTyping, setSmartTyping] = useState(loadSmartTyping);
+  const [typingLog, setTypingLog] = useState(loadTypingLog);
+  const [showTypingLog, setShowTypingLog] = useState(false);
   const [selectedWinId, setSelectedWinId] = useState<string | null>(null);
   const [selectedTabId, setSelectedTabId] = useState<string | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
@@ -196,6 +230,9 @@ export default function App() {
   useEffect(() => { splitWinIdRef.current = splitWinId; }, [splitWinId]);
   useEffect(() => { splitTabIdRef.current = splitTabId; }, [splitTabId]);
   useEffect(() => { paneMapOpenRef.current = showPaneMap; }, [showPaneMap]);
+  useEffect(() => {
+    try { localStorage.setItem(TYPING_LOG_KEY, typingLog); } catch {}
+  }, [typingLog]);
 
   // --- Socket init ---
   useEffect(() => {
@@ -452,6 +489,7 @@ export default function App() {
     saveHistory(h);
     historyIdxRef.current = -1;
     savedCommandRef.current = '';
+    setTypingLog(prev => appendTypingLog(prev, command.trim(), true));
 
     if (broadcastMode && broadcastTargets.size > 0) {
       // Broadcast to all selected windows' active sessions
@@ -563,6 +601,11 @@ export default function App() {
 
   const handleNewTab = () => socketRef.current?.emit('newTab');
   const handleCloseTab = () => socketRef.current?.emit('closeTab');
+  // vertical=true divider (side-by-side panes) mirrors iTerm2's own Cmd+D
+  // "Split Vertically"; vertical=false (stacked panes) mirrors Cmd+Shift+D
+  // "Split Horizontally".
+  const handleSplitPane = (sessionId: string | undefined, vertical: boolean) =>
+    socketRef.current?.emit('splitPane', { sessionId, vertical });
 
   const handleSplitWindowChange = (winId: string) => {
     setSplitWinId(winId);
@@ -656,6 +699,14 @@ export default function App() {
     commandInputRef.current?.focus({ preventScroll: true });
   };
 
+  const toggleSmartTyping = () => {
+    setSmartTyping(prev => {
+      const next = !prev;
+      try { localStorage.setItem(SMART_TYPING_KEY, next ? '1' : '0'); } catch {}
+      return next;
+    });
+  };
+
   const handleInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     if (!directInputMode) {
       setCommand(event.currentTarget.value);
@@ -672,7 +723,20 @@ export default function App() {
       return;
     }
 
-    if (value) sendSpecialKey(value);
+    if (!value) {
+      // The box is reset to empty after every forwarded key, so it's
+      // normally already empty — backspacing/deleting on an already-empty
+      // box changes nothing, leaving no value to infer a delete from.
+      // inputType is the only signal available for that case.
+      if (inputEvent.inputType === 'deleteContentBackward') {
+        sendSpecialKey(DIRECT_INPUT_KEYS.Backspace);
+      } else if (inputEvent.inputType === 'deleteContentForward') {
+        sendSpecialKey(DIRECT_INPUT_KEYS.Delete);
+      }
+      return;
+    }
+    sendSpecialKey(value);
+    setTypingLog(prev => appendTypingLog(prev, value, false));
     setDirectInputValue('');
   };
 
@@ -695,7 +759,10 @@ export default function App() {
   const handlePaste = async () => {
     try {
       const text = await navigator.clipboard.readText();
-      if (text) socketRef.current?.emit('sendKeys', { sessionId: getActiveSessionId(), keys: text });
+      if (text) {
+        socketRef.current?.emit('sendKeys', { sessionId: getActiveSessionId(), keys: text });
+        setTypingLog(prev => appendTypingLog(prev, text, true));
+      }
     } catch {}
   };
 
@@ -1151,6 +1218,22 @@ export default function App() {
             {tabCount}
           </span>
           <button
+            onClick={() => handleSplitPane(selectedSessionId ?? undefined, true)}
+            className={`flex items-center justify-center w-11 text-zinc-600 active:text-zinc-400 transition-colors ${isLandscape ? 'min-h-[32px]' : 'min-h-[44px]'}`}
+            aria-label="Split pane vertically"
+            title="Split vertically (side by side)"
+          >
+            <Columns2 className="w-4 h-4" />
+          </button>
+          <button
+            onClick={() => handleSplitPane(selectedSessionId ?? undefined, false)}
+            className={`flex items-center justify-center w-11 text-zinc-600 active:text-zinc-400 transition-colors ${isLandscape ? 'min-h-[32px]' : 'min-h-[44px]'}`}
+            aria-label="Split pane horizontally"
+            title="Split horizontally (stacked)"
+          >
+            <Rows2 className="w-4 h-4" />
+          </button>
+          <button
             onClick={handleCloseTab}
             disabled={tabCount <= 1}
             className={`flex items-center justify-center w-11 text-zinc-600 active:text-red-400 transition-colors disabled:opacity-20 ${isLandscape ? 'min-h-[32px]' : 'min-h-[44px]'}`}
@@ -1309,6 +1392,22 @@ export default function App() {
               <div className="flex items-center flex-shrink-0 ml-auto border-l border-zinc-800/60">
                 <span className="text-[10px] text-zinc-600 font-bold px-2 tabular-nums">{splitTabCount}</span>
                 <button
+                  onClick={(e) => { e.stopPropagation(); handleSplitPane(splitSessionId ?? undefined, true); }}
+                  className="flex items-center justify-center w-8 min-h-[30px] text-zinc-600 active:text-zinc-400 transition-colors"
+                  aria-label="Split pane vertically"
+                  title="Split vertically (side by side)"
+                >
+                  <Columns2 className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); handleSplitPane(splitSessionId ?? undefined, false); }}
+                  className="flex items-center justify-center w-8 min-h-[30px] text-zinc-600 active:text-zinc-400 transition-colors"
+                  aria-label="Split pane horizontally"
+                  title="Split horizontally (stacked)"
+                >
+                  <Rows2 className="w-3.5 h-3.5" />
+                </button>
+                <button
                   onClick={(e) => { e.stopPropagation(); socketRef.current?.emit('closeTab'); }}
                   disabled={splitTabCount <= 1}
                   className="flex items-center justify-center w-8 min-h-[30px] text-zinc-600 active:text-red-400 transition-colors disabled:opacity-20"
@@ -1400,6 +1499,10 @@ export default function App() {
         />
       )}
 
+      {showTypingLog && (
+        <TypingLogOverlay log={typingLog} onClose={() => setShowTypingLog(false)} />
+      )}
+
       {/* ── Quick Actions ── */}
       <div className={`flex items-center gap-1.5 bg-zinc-950/60 border-t border-zinc-800/40 flex-shrink-0 overflow-x-auto no-scrollbar ${isLandscape ? 'px-2 py-1' : 'px-3 py-2'}`}>
         <QuickBtn label="ESC" onClick={() => sendSpecialKey('\x1b')} color="#f87171" />
@@ -1410,6 +1513,8 @@ export default function App() {
         <div className="w-px h-5 bg-zinc-800 mx-1 flex-shrink-0" />
         <QuickBtn icon={<ChevronUp className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[A')} color="#a78bfa" />
         <QuickBtn icon={<ChevronDown className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[B')} color="#a78bfa" />
+        <QuickBtn icon={<ChevronLeft className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[D')} color="#a78bfa" />
+        <QuickBtn icon={<ChevronRight className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[C')} color="#a78bfa" />
         <QuickBtn label="TAB" onClick={() => sendSpecialKey('\t')} color="#818cf8" />
         {/* Real Return (CR, 0x0D): submits in shells AND raw-mode TUIs like Claude Code */}
         <QuickBtn icon={<CornerDownLeft className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\r')} color="#34d399" />
@@ -1419,6 +1524,7 @@ export default function App() {
         <QuickBtn icon={<Clipboard className="w-3.5 h-3.5" />} onClick={handlePaste} color="#38bdf8" />
         <QuickBtn icon={<Copy className="w-3.5 h-3.5" />} onClick={handleCopy} color="#71717a" />
         <QuickBtn icon={<Trash2 className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x15')} color="#fb7185" />
+        <QuickBtn icon={<ScrollText className="w-3.5 h-3.5" />} onClick={() => setShowTypingLog(true)} color="#facc15" />
       </div>
 
       {/* ── Buffered command / native direct input ── */}
@@ -1437,6 +1543,21 @@ export default function App() {
           >
             {directInputMode ? <Terminal className="w-4 h-4" /> : <Keyboard className="w-4 h-4" />}
           </button>
+          {!directInputMode && (
+            <button
+              onClick={toggleSmartTyping}
+              className="w-10 h-10 flex items-center justify-center rounded-xl border transition-all active:scale-90 flex-shrink-0"
+              style={{
+                color: smartTyping ? '#09090b' : '#71717a',
+                backgroundColor: smartTyping ? ACCENT : '#27272a10',
+                borderColor: smartTyping ? ACCENT : '#3f3f46',
+              }}
+              aria-label={smartTyping ? 'Turn off autocorrect' : 'Turn on autocorrect'}
+              title={smartTyping ? 'Autocorrect on' : 'Autocorrect off'}
+            >
+              <SpellCheck2 className="w-4 h-4" />
+            </button>
+          )}
           <div
             className="flex-1 flex items-center gap-2 bg-zinc-900/60 border rounded-2xl pl-4 pr-1.5 py-1 transition-colors"
             style={{
@@ -1463,10 +1584,14 @@ export default function App() {
               onChange={handleInputChange}
               onKeyDown={handleInputKeyDown}
               enterKeyHint={directInputMode ? 'enter' : 'send'}
-              autoCapitalize="none"
+              // Live/direct input always forces these off: autocorrecting
+              // mid-keystroke would corrupt whatever is being typed
+              // character-by-character straight into the terminal. Only the
+              // buffered command box honors the smartTyping toggle.
+              autoCapitalize={!directInputMode && smartTyping ? 'sentences' : 'none'}
               autoComplete="off"
-              autoCorrect="off"
-              spellCheck={false}
+              autoCorrect={!directInputMode && smartTyping ? 'on' : 'off'}
+              spellCheck={!directInputMode && smartTyping}
             />
             {directInputMode ? (
               <span className="px-2 text-[9px] font-bold tracking-[0.16em] text-violet-400 flex-shrink-0">
@@ -1577,6 +1702,77 @@ function TabListOverlay({ tabs, selectedId, accent, onSelect, onClose }: {
   );
 }
 
+// --- Recent typing log: an editable scratchpad for reviewing/correcting/
+// copying what was actually sent to the terminal, independent of whether it
+// came from the buffered command box or direct/live input. Edits here are
+// local to the textarea only — they don't rewrite the persisted rolling log,
+// which keeps accumulating verbatim as ground truth for next time.
+function TypingLogOverlay({ log, onClose }: { log: string; onClose: () => void }) {
+  const [draft, setDraft] = useState(log);
+  const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => { if (copyTimerRef.current) clearTimeout(copyTimerRef.current); }, []);
+
+  const handleCopyDraft = async () => {
+    try {
+      await navigator.clipboard.writeText(draft);
+      setCopied(true);
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+      copyTimerRef.current = setTimeout(() => setCopied(false), 1500);
+    } catch {}
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-[70] flex items-start justify-center px-4 pt-[max(3rem,env(safe-area-inset-top))] pb-[max(3rem,env(safe-area-inset-bottom))]"
+      onClick={onClose}
+      style={{ backgroundColor: 'rgba(0,0,0,0.82)', backdropFilter: 'blur(10px)', WebkitBackdropFilter: 'blur(10px)' }}
+    >
+      <div
+        className="flex w-full max-w-lg flex-col overflow-hidden rounded-xl border border-zinc-700/60 bg-[#111113] shadow-2xl"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3 flex-shrink-0">
+          <span className="text-[10px] font-bold tracking-[0.2em] text-zinc-500">
+            RECENT TYPING
+          </span>
+          <button
+            onClick={onClose}
+            className="flex h-7 w-7 items-center justify-center rounded-md text-zinc-600 active:bg-zinc-800 active:text-zinc-300"
+            aria-label="Close typing log"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+        <textarea
+          value={draft}
+          onChange={(event) => setDraft(event.currentTarget.value)}
+          placeholder="Nothing typed yet."
+          autoCapitalize="none"
+          autoCorrect="off"
+          spellCheck={false}
+          className="h-[45vh] w-full resize-none bg-transparent p-4 text-[13px] leading-relaxed text-zinc-100 placeholder:text-zinc-700 font-mono outline-none"
+        />
+        <div className="flex items-center justify-end gap-2 border-t border-zinc-800 px-3 py-2 flex-shrink-0">
+          <button
+            onClick={handleCopyDraft}
+            className="flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[11px] font-bold tracking-wide transition-all active:scale-95"
+            style={{
+              color: copied ? '#09090b' : '#facc15',
+              backgroundColor: copied ? '#facc15' : '#facc1510',
+              borderColor: '#facc1530',
+            }}
+          >
+            <Copy className="h-3.5 w-3.5" />
+            {copied ? 'Copied' : 'Copy'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // --- Tiny terminal thumbnail shown inside each pane-map cell ---
 // Renders the tail of a pane's cached content in miniature, faithful colors.
 const PanePreview = memo(function PanePreview({ content }: { content?: StyledContent }) {
@@ -1654,6 +1850,12 @@ function QuickBtn({ label, icon, onClick, color }: {
 }) {
   return (
     <button
+      // Tapping a button normally moves focus to it before the click fires,
+      // which blurs the command input and closes the mobile keyboard. These
+      // buttons are meant to be used *while* typing (direct or buffered), so
+      // preventing the mousedown's default focus change keeps the input —
+      // and its keyboard — focused; the click still fires normally.
+      onMouseDown={(event) => event.preventDefault()}
       onClick={onClick}
       className="flex items-center justify-center min-w-[40px] h-[36px] px-2.5 rounded-lg border transition-all active:scale-90 flex-shrink-0"
       style={{
