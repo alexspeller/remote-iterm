@@ -82,6 +82,12 @@ An independent process — deliberately separate from the phone server so a bug 
 
 A stdlib-only iTerm2 AutoLaunch script (installed via `iterm-snapshot install`) that starts the whole stack — phone server, Vite client, and snapshotter — through the existing `iterm-server` launcher whenever iTerm2 launches, and stops it when iTerm2 quits. It intentionally does not import the iTerm2 API (which would consume the single AutoLaunch `ITERM2_COOKIE` the child processes need) and runs the children through the user's login shell so their real `PATH` (for `npx vite`) is present. iTerm2 quit is detected via a signal handler and a parent-pid watch.
 
+**Startup contract.** `iterm-server start` is slow by design: it holds its lock until the children it spawned are actually listening, so the supervisor's 5s poll queues behind a start in progress instead of racing it. Three rules keep that from turning into a livelock, all of which have failed in practice at least once:
+
+1. A `server.py` that exists but has not bound 7291 yet is *adopted and waited for*, not killed — it is usually still handshaking with iTerm2, which takes minutes on a loaded Mac. Respawning instead means no attempt ever gets long enough to finish, since the next poll arrives every 5s. Only once a process passes `SERVER_START_SECONDS` is it treated as stuck and reaped.
+2. The supervisor's `START_TIMEOUT` must stay comfortably above `iterm-server`'s worst case (`LOCK_WAIT_SECONDS + SERVER_START_SECONDS + CLIENT_START_SECONDS`). If the supervisor's kill lands first, the shell dies without releasing the lock.
+3. The lock records its holder's pid and any run may reclaim it once that holder is gone, because SIGKILL cannot be trapped. Without this a single mistimed kill wedges every subsequent start.
+
 ## Socket.IO contract
 
 The protocol intentionally evolves the upstream event names where possible so the UI and backend remain loosely coupled.

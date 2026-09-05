@@ -12,9 +12,83 @@ fi
 
 PIDFILE="$DIR/.iterm-server.pid"
 LOGFILE="$DIR/.iterm-server.log"
+LOCKDIR="$DIR/.iterm-server.lock"
 VENV="$DIR/server/.venv"
 REQ="$DIR/server/requirements.txt"
 STAMP="$VENV/.requirements.sha"
+
+# Every wait below is bounded by one of these, and the AutoLaunch supervisor's
+# subprocess timeout (autolaunch/remote-iterm.py START_TIMEOUT) must exceed
+# their worst-case sum. If the supervisor's kill lands first the shell dies
+# without running with_lock's RETURN trap, so the lock is left behind and the
+# next poll burns its whole budget waiting on a lock nobody holds.
+LOCK_WAIT_SECONDS=${LOCK_WAIT_SECONDS:-90}
+# How long one server.py gets to finish its iTerm2 handshake and bind 7291.
+# iTerm2 serves API requests on its main thread, so on a loaded Mac this runs
+# to minutes — stalls of 65s, 88s and 118s have all been measured here.
+SERVER_START_SECONDS=${SERVER_START_SECONDS:-180}
+CLIENT_START_SECONDS=${CLIENT_START_SECONDS:-120}
+
+now_seconds() { date +%s; }
+
+# Serializes start/stop/restart against each other. Needed because the
+# AutoLaunch supervisor now polls every 5s (see autolaunch/remote-iterm.py)
+# and calls `start` whenever anything looks down — including the few-second
+# window while a manual `restart` is itself stopping and restarting things.
+# Without this, two concurrent `do_start` calls can each see snapshot.py as
+# not-yet-up (it has no port to synchronize on, unlike the server/client) and
+# both spawn one, leaking a duplicate process. `mkdir` is atomic across
+# processes on the same filesystem, so it doubles as a portable lock (macOS
+# has no built-in `flock` binary).
+with_lock() {
+  local deadline holder stale
+  deadline=$(( $(now_seconds) + LOCK_WAIT_SECONDS ))
+  while ! mkdir "$LOCKDIR" 2>/dev/null; do
+    # Recover a lock whose holder is gone. Anything that kills this script
+    # outright — the supervisor's own timeout, a reboot mid-start — skips the
+    # RETURN trap below, and without this every later run would wait out its
+    # full budget on an abandoned lock and then fail exactly the same way.
+    # Renaming before deleting keeps the recovery itself race-free: two
+    # processes can both see the dead holder, but only one `mv` can succeed,
+    # and the loser simply finds the directory already gone and loops.
+    holder="$(cat "$LOCKDIR/pid" 2>/dev/null)"
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      stale="$LOCKDIR.stale.$$"
+      if mv "$LOCKDIR" "$stale" 2>/dev/null; then
+        echo "  Cleared stale lock left by dead process $holder" >&2
+        rm -rf "$stale"
+      fi
+      continue
+    fi
+    if [ "$(now_seconds)" -ge "$deadline" ]; then
+      echo "  Timed out waiting for another iterm-server operation to finish" >&2
+      return 1
+    fi
+    sleep 0.2
+  done
+  echo $$ > "$LOCKDIR/pid"
+  # EXIT, not RETURN: bash 3.2's RETURN trap does not reliably fire on the
+  # return of the function that set it — it can skip that one and fire on a
+  # later, unrelated function's return instead (verified on 3.2.57). Every
+  # caller exits the script the moment this returns, so EXIT is both correct
+  # and simpler. SIGKILL still cannot be caught, which is what the stale-lock
+  # recovery above is for.
+  trap 'release_lock; exit 130' INT
+  trap 'release_lock; exit 143' TERM
+  trap release_lock EXIT
+  "$@"
+  local rc=$?
+  release_lock
+  trap - INT TERM EXIT
+  return $rc
+}
+
+# Only ever removes a lock this process owns, so a stale-lock recovery racing
+# with us can never delete the lock its winner just took.
+release_lock() {
+  [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCKDIR" 2>/dev/null
+  return 0
+}
 
 get_local_ip() {
   ipconfig getifaddr en0 2>/dev/null || echo "localhost"
@@ -56,34 +130,183 @@ ensure_venv() {
   return 0
 }
 
+# True if anything is listening on $1. bash's /dev/tcp costs ~0.007s against
+# lsof's ~0.12s, which matters because the wait loop calls this hundreds of
+# times: built on lsof, a nominally 45s wait actually ran ~100s of wall clock
+# and so collided with the supervisor's kill timeout. Only use lsof where the
+# *pid* holding the port is needed, not for a plain liveness question.
+port_listening() {
+  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+
+# Wait up to $3 seconds for port $1 to be listening, giving up early if the
+# process we are waiting on ($2) dies. Deadline-based rather than counting
+# iterations, so the budget is real wall-clock time however slow the probe is.
+wait_for_port() {
+  local port="$1" pid="$2" budget="$3" deadline
+  deadline=$(( $(now_seconds) + budget ))
+  while :; do
+    port_listening "$port" && return 0
+    [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null && return 1
+    [ "$(now_seconds)" -ge "$deadline" ] && return 1
+    sleep 0.25
+  done
+}
+
+# Age of pid $1 in seconds. macOS ps has no `etimes` keyword, so its formatted
+# [[dd-]hh:]mm:ss elapsed field has to be parsed. Fails if the process is gone.
+proc_age_seconds() {
+  local etime rest days=0 hours=0 mins secs
+  etime="$(ps -p "$1" -o etime= 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$etime" ] || return 1
+  case "$etime" in
+    *-*) days="${etime%%-*}"; etime="${etime#*-}" ;;
+  esac
+  case "$etime" in
+    *:*:*) hours="${etime%%:*}"; rest="${etime#*:}" ;;
+    *)     rest="$etime" ;;
+  esac
+  mins="${rest%%:*}"
+  secs="${rest##*:}"
+  # 10# forces base 10: ps zero-pads, and bash reads a leading 0 as octal.
+  echo $(( 10#$days * 86400 + 10#$hours * 3600 + 10#$mins * 60 + 10#$secs ))
+}
+
+# Kill processes that are alive but not doing their job: a server.py that
+# isn't listening and is past saving, and any snapshot.py beyond the tracked
+# one. These matter more than ordinary litter because each holds an open
+# iTerm2 API connection with live notification subscriptions, adding load to
+# exactly the thing that was already too slow to answer. $1 spares a server
+# that do_start has adopted as still-starting — see the adoption block there
+# for why killing that one is worse than leaving it.
+reap_orphans() {
+  local keep_server="$1" keep_snapshot="$2" listening="" pid
+  listening=" $(lsof -nP -tiTCP:7291 -sTCP:LISTEN 2>/dev/null | tr '\n' ' ')"
+  for pid in $(pgrep -f -- '-u server.py' 2>/dev/null); do
+    case "$listening" in *" $pid "*) continue ;; esac
+    [ -n "$keep_server" ] && [ "$pid" = "$keep_server" ] && continue
+    echo "  Reaping stuck server process $pid"
+    kill -9 "$pid" 2>/dev/null
+  done
+  for pid in $(pgrep -f -- '-u snapshot.py' 2>/dev/null); do
+    [ "$pid" = "$keep_snapshot" ] && continue
+    echo "  Reaping leftover snapshotter $pid"
+    kill -9 "$pid" 2>/dev/null
+  done
+}
+
+# True if $1 is a live process whose command line contains $2 — used for
+# snapshot.py, which (unlike the server/client) has no port to probe, so
+# liveness has to come from the pidfile. Checking the command line too
+# defends against the pid having been recycled by an unrelated process.
+_pid_alive_running() {
+  local pid="$1" pattern="$2"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+    && ps -p "$pid" -o command= 2>/dev/null | grep -q "$pattern"
+}
+
+# Reconciles each of the three children independently rather than gating on
+# a single "already running" check — otherwise, if only snapshot.py died
+# (self-exited after its iTerm2 connection went bad — see server/snapshot.py
+# connection_watchdog) while the phone server's port was still open, `start`
+# would see port 7291 up and do nothing, leaving snapshot.py dead forever.
+# This is what makes the AutoLaunch supervisor's periodic restart actually
+# repair a partially-dead stack instead of only a fully-dead one.
 do_start() {
-  local shared_key
-  if lsof -nP -tiTCP:7291 -sTCP:LISTEN >/dev/null 2>&1; then
+  local shared_key old_server_pid="" old_client_pid="" old_snapshot_pid=""
+  if [ -f "$PIDFILE" ]; then
+    read -r old_server_pid old_client_pid old_snapshot_pid < "$PIDFILE"
+  fi
+
+  local server_up=0 client_up=0 snapshot_up=0
+  port_listening 7291 && server_up=1
+  port_listening 7292 && client_up=1
+  _pid_alive_running "$old_snapshot_pid" "snapshot.py" && snapshot_up=1
+
+  if [ "$server_up" = 1 ] && [ "$client_up" = 1 ] && [ "$snapshot_up" = 1 ]; then
     echo "  Already running"
     return 1
   fi
-  if lsof -nP -tiTCP:7292 -sTCP:LISTEN >/dev/null 2>&1; then
-    echo "  Client port 7292 is already in use"
-    return 1
+
+  # A server.py that exists but isn't listening yet may simply still be
+  # handshaking with iTerm2, which takes minutes on a loaded Mac. Adopt it and
+  # wait out the remainder of its budget rather than killing it and restarting
+  # the clock: the supervisor polls every 5s and calls `start` whenever the
+  # port is down, so respawning here means no single attempt ever gets long
+  # enough to finish. That is a livelock, not a retry — it kept the stack down
+  # for 68 minutes on 2026-09-02, across 26 consecutive starts, none of which
+  # ever bound the port. Past the budget the process really is stuck, and the
+  # branch below falls through to reaping it.
+  local adopted_server="" server_budget="$SERVER_START_SECONDS" age pid
+  if [ "$server_up" = 0 ]; then
+    for pid in $(pgrep -f -- '-u server.py' 2>/dev/null); do
+      age="$(proc_age_seconds "$pid")" || continue
+      if [ "$age" -lt "$SERVER_START_SECONDS" ]; then
+        adopted_server="$pid"
+        server_budget=$(( SERVER_START_SECONDS - age ))
+        echo "  Phone server $pid is still starting (${age}s) — waiting for it"
+        break
+      fi
+    done
   fi
+
+  # Only safe here: before anything is spawned, so it can never hit a child
+  # this run is about to create.
+  reap_orphans "$adopted_server" \
+               "$([ "$snapshot_up" = 1 ] && echo "$old_snapshot_pid")"
 
   ensure_venv || return 1
   shared_key="$("$VENV/bin/python" "$DIR/server/auth.py")" || return 1
 
-  # exec in the subshell so $! is the real daemon pid (not the subshell wrapper),
-  # which keeps the pidfile accurate for `stop`.
-  ( cd "$DIR/server" && exec "$VENV/bin/python" -u server.py >> "$LOGFILE" 2>&1 ) &
-  SERVER_PID=$!
+  local server_pid="$old_server_pid" client_pid="$old_client_pid" \
+        snapshot_pid="$old_snapshot_pid"
 
-  ( cd "$DIR/client" && exec npx vite --host --port 7292 --strictPort >> "$LOGFILE" 2>&1 ) &
-  CLIENT_PID=$!
+  # exec in each subshell so $! is the real daemon pid (not the subshell
+  # wrapper), which keeps the pidfile accurate for `stop`.
+  if [ -n "$adopted_server" ]; then
+    server_pid="$adopted_server"
+  elif [ "$server_up" = 0 ]; then
+    echo "  Starting phone server…"
+    ( cd "$DIR/server" && exec "$VENV/bin/python" -u server.py >> "$LOGFILE" 2>&1 ) &
+    server_pid=$!
+  fi
 
-  # Independent state snapshotter (crash-recovery safety net). No port of its own,
-  # so it is tracked and stopped via the pidfile only.
-  ( cd "$DIR/server" && exec "$VENV/bin/python" -u snapshot.py >> "$LOGFILE" 2>&1 ) &
-  SNAPSHOT_PID=$!
+  if [ "$client_up" = 0 ]; then
+    if lsof -nP -tiTCP:7292 -sTCP:LISTEN >/dev/null 2>&1; then
+      echo "  Client port 7292 is already in use"
+    else
+      echo "  Starting client…"
+      ( cd "$DIR/client" && exec npx vite --host --port 7292 --strictPort >> "$LOGFILE" 2>&1 ) &
+      client_pid=$!
+    fi
+  fi
 
-  echo "$SERVER_PID $CLIENT_PID $SNAPSHOT_PID" > "$PIDFILE"
+  # Independent state snapshotter (crash-recovery safety net). No port of its
+  # own, so it is tracked and stopped via the pidfile only.
+  if [ "$snapshot_up" = 0 ]; then
+    echo "  Starting snapshotter…"
+    ( cd "$DIR/server" && exec "$VENV/bin/python" -u snapshot.py >> "$LOGFILE" 2>&1 ) &
+    snapshot_pid=$!
+  fi
+
+  echo "$server_pid $client_pid $snapshot_pid" > "$PIDFILE"
+
+  # Block until the children we started are serving, so the lock is still held
+  # when the next supervisor poll arrives. Returning as soon as they were
+  # *spawned* is what produced the restart storm: the supervisor polls every
+  # 5s, the backend takes longer than that to bind, so every poll during
+  # startup launched another server that then died with EADDRINUSE.
+  if [ "$server_up" = 0 ] && [ -n "$server_pid" ]; then
+    if wait_for_port 7291 "$server_pid" "$server_budget"; then
+      echo "  Phone server ready"
+    else
+      echo "  Phone server still not listening after ${server_budget}s — see $LOGFILE" >&2
+    fi
+  fi
+  if [ "$client_up" = 0 ] && [ -n "$client_pid" ]; then
+    wait_for_port 7292 "$client_pid" "$CLIENT_START_SECONDS" || \
+      echo "  Client did not start — see $LOGFILE" >&2
+  fi
 
   IP=$(get_local_ip)
   URL="http://${IP}:7292/#key=${shared_key}"
@@ -148,6 +371,11 @@ do_stop() {
     sleep 0.1
   done
 
+  # Sweep anything the pidfile and the ports could not account for. Without
+  # this a `restart` can hand do_start a leftover server.py young enough to be
+  # adopted, so the restart silently keeps the process it was asked to replace.
+  reap_orphans "" ""
+
   if [ "$killed" = "1" ]; then
     echo "  Stopped"
   else
@@ -155,9 +383,19 @@ do_stop() {
   fi
 }
 
+# Stop and start under a single lock. Taking the lock twice left a gap the
+# AutoLaunch supervisor could step into: its 5s poll sees the port down, runs
+# its own `start`, and the restart then blocks behind it for the full lock
+# timeout before finding everything already up.
+do_restart() {
+  do_stop
+  sleep 1
+  do_start
+}
+
 case "${1:-start}" in
-  start)   do_start ;;
-  stop)    do_stop ;;
-  restart) do_stop; sleep 1; do_start ;;
+  start)   with_lock do_start ;;
+  stop)    with_lock do_stop ;;
+  restart) with_lock do_restart ;;
   *)       echo "Usage: iterm-server [start|stop|restart]" ;;
 esac

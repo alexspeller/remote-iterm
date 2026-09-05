@@ -7,3 +7,4 @@ dist/
 .iterm-server.log
 *.log
 bun.lock
+.iterm-server.lock*
