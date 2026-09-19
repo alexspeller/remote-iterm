@@ -150,6 +150,42 @@ describe('the unsent command', () => {
   });
 });
 
+describe('smart typing', () => {
+  const smartTypingToggle = (name: 'Turn on autocorrect' | 'Turn off autocorrect') =>
+    screen.getByRole('button', { name });
+
+  it('leaves the shell line uncapitalized even with autocorrect on', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(smartTypingToggle('Turn on autocorrect'));
+
+    // Autocorrect and auto-capitalization are separate keyboard traits, and
+    // only the first one is wanted: `Git status` is not a command.
+    expect(commandBox().getAttribute('autocorrect')).toBe('on');
+    expect(commandBox().getAttribute('autocapitalize')).toBe('none');
+    expect(commandBox().getAttribute('spellcheck')).toBe('true');
+  });
+
+  it('keeps autocorrect off, and capitals off, when smart typing is off', () => {
+    render(<App />);
+    expect(commandBox().getAttribute('autocorrect')).toBe('off');
+    expect(commandBox().getAttribute('autocapitalize')).toBe('none');
+    expect(commandBox().getAttribute('spellcheck')).toBe('false');
+  });
+
+  it('stays on across a reload, still without capitals', async () => {
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(smartTypingToggle('Turn on autocorrect'));
+
+    reloadPage();
+
+    expect(smartTypingToggle('Turn off autocorrect')).toBeTruthy();
+    expect(commandBox().getAttribute('autocorrect')).toBe('on');
+    expect(commandBox().getAttribute('autocapitalize')).toBe('none');
+  });
+});
+
 describe('links in terminal output', () => {
   it('renders a linked run as an anchor that opens in a new tab', () => {
     showPane([[{ t: 'see ' }, { t: 'https://example.com/x', u: 'https://example.com/x' }, { t: ' now' }]]);

@@ -1830,7 +1830,14 @@ export default function App() {
               // mid-keystroke would corrupt whatever is being typed
               // character-by-character straight into the terminal. Only the
               // buffered command box honors the smartTyping toggle.
-              autoCapitalize={!directInputMode && smartTyping ? 'sentences' : 'none'}
+              //
+              // Auto-capitalization stays off either way. It is a separate
+              // keyboard trait from autocorrection (WebKit carries them as
+              // independent autocapitalizeType / isAutocorrect fields), so
+              // smart typing can have one without the other — and a shell
+              // line starting with a capital is wrong far more often than
+              // it is right.
+              autoCapitalize="none"
               autoComplete="off"
               autoCorrect={!directInputMode && smartTyping ? 'on' : 'off'}
               spellCheck={!directInputMode && smartTyping}
