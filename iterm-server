@@ -355,6 +355,13 @@ do_start() {
       echo "  Client did not start — see $LOGFILE" >&2
   fi
 
+  print_urls "$shared_key"
+}
+
+# The QR code and both URLs for the running stack. `url` prints them on
+# demand — `start` only prints them when it actually starts something.
+print_urls() {
+  local shared_key="$1" IP URL
   IP=$(get_local_ip)
   URL="http://${IP}:7292/#key=${shared_key}"
   "$VENV/bin/python" - "$URL" <<'PYQR'
@@ -379,6 +386,13 @@ print()
 print("  Scan the QR from your phone (same Wi-Fi)")
 print()
 PYQR
+}
+
+do_url() {
+  local shared_key
+  ensure_venv || return 1
+  shared_key="$("$VENV/bin/python" "$DIR/server/auth.py")" || return 1
+  print_urls "$shared_key"
 }
 
 do_stop() {
@@ -444,5 +458,6 @@ case "${1:-start}" in
   start)   with_lock do_start ;;
   stop)    with_lock do_stop ;;
   restart) with_lock do_restart ;;
-  *)       echo "Usage: iterm-server [start|stop|restart]" ;;
+  url)     do_url ;;
+  *)       echo "Usage: iterm-server [start|stop|restart|url]" ;;
 esac

@@ -125,6 +125,32 @@ if not WEBSOCKET_COMPRESSION:
     engineio_aiohttp.WebSocketResponse = functools.partial(
         web.WebSocketResponse, compress=False)
 
+
+class _ReportingWebSocket(engineio_aiohttp.WebSocket):
+    """python-engineio's aiohttp WebSocket wrapper, logging how each socket
+    ended. Engine.IO reduces every ending to 'transport close'; aiohttp
+    knows the close code (1000 a clean close by the peer, 1006 the TCP
+    connection lost without one) and the exception a reset raised, which
+    is the difference between a page letting go and a network path being
+    torn down under it.
+    """
+
+    async def wait(self):
+        try:
+            return await super().wait()
+        except Exception as err:
+            sock = self._sock
+            request = getattr(self, "environ", {}).get("aiohttp.request")
+            log(f"websocket from {getattr(request, 'remote', '?')} ended: "
+                f"close_code={getattr(sock, 'close_code', None)} "
+                f"exception={(sock.exception() if sock is not None else None)!r} "
+                f"raised={err!r}")
+            raise
+
+
+# The driver table holds the class object, not the module attribute.
+engineio_aiohttp._async["websocket"] = _ReportingWebSocket
+
 sio = socketio.AsyncServer(async_mode="aiohttp", cors_allowed_origins=_origin_allowed)
 
 clients: set[str] = set()

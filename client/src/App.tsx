@@ -150,6 +150,15 @@ function observeTransport(socket: Socket) {
     if (!(ws instanceof WebSocket)) return;
     ws.addEventListener('close', (event) => {
       lastSocketClose = { code: event.code, reason: event.reason, wasClean: event.wasClean, at: Date.now() };
+      // Socket.IO reports its disconnect before the WebSocket's own close
+      // event arrives, so attach the code to the record just written.
+      try {
+        const raw = sessionStorage.getItem(LAST_DISCONNECT_KEY);
+        const parsed: unknown = raw ? JSON.parse(raw) : null;
+        if (isLastDisconnect(parsed) && Date.now() - parsed.at < 5000) {
+          sessionStorage.setItem(LAST_DISCONNECT_KEY, JSON.stringify({ ...parsed, socketClose: lastSocketClose }));
+        }
+      } catch {}
     });
   };
   watchWebSocket(engine.transport);
@@ -1088,6 +1097,11 @@ export default function App() {
   // Panes (split sessions) of the primary tab — drives the per-tab pane switcher.
   const primaryTab = activeWindow?.tabs.find(t => t.id === selectedTabId);
   const primaryPanes = primaryTab?.sessions || [];
+  // The pane the map's close button acts on, identified to the user the same
+  // way the map labels it: by its position in the grid.
+  const selectedPaneIndex = primaryPanes.findIndex(pane => pane.id === selectedSessionId);
+  const selectedPaneNumber = selectedPaneIndex >= 0 ? selectedPaneIndex + 1 : null;
+  const selectedPaneName = selectedPaneIndex >= 0 ? primaryPanes[selectedPaneIndex].name : '';
 
   // All other sessions for split picker (exclude current active)
   const allSessions = useMemo(() => {
@@ -1486,7 +1500,44 @@ export default function App() {
               );
             })}
           </div>
-          <span className="text-[10px] text-zinc-600 mt-3 tracking-wider">tap a pane · tap outside to close</span>
+          {/* The footer is inside the dismiss-on-tap backdrop, so it has to
+              stop its own clicks from bubbling out and closing the map. */}
+          <div className="mt-3 flex items-center gap-2 px-4" onClick={(e) => e.stopPropagation()}>
+            {paneCloseArmed ? (
+              <>
+                <span className="text-[10px] tracking-wider" style={{ color: DANGER }}>
+                  close pane {selectedPaneNumber}{selectedPaneName ? ` “${selectedPaneName}”` : ''}?
+                </span>
+                <button
+                  onClick={() => setPaneCloseArmed(false)}
+                  className="px-3 h-8 rounded-lg border border-zinc-700 text-[10px] font-bold tracking-wider text-zinc-400 active:scale-95 transition-all"
+                >
+                  KEEP
+                </button>
+                <button
+                  onClick={handleClosePane}
+                  className="px-3 h-8 rounded-lg border text-[10px] font-bold tracking-wider active:scale-95 transition-all"
+                  style={{ borderColor: DANGER, backgroundColor: DANGER + '20', color: DANGER }}
+                >
+                  CLOSE
+                </button>
+              </>
+            ) : (
+              <>
+                <span className="text-[10px] text-zinc-600 tracking-wider">tap a pane · tap outside to close</span>
+                {selectedPaneNumber !== null && (
+                  <button
+                    onClick={() => setPaneCloseArmed(true)}
+                    className="flex items-center gap-1 px-2.5 h-8 rounded-lg border text-[10px] font-bold tracking-wider active:scale-95 transition-all"
+                    style={{ borderColor: DANGER + '40', backgroundColor: DANGER + '12', color: DANGER }}
+                  >
+                    <X className="w-3 h-3" />
+                    CLOSE PANE {selectedPaneNumber}
+                  </button>
+                )}
+              </>
+            )}
+          </div>
         </div>
       )}
 

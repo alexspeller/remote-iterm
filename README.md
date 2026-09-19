@@ -27,6 +27,7 @@ The unqualified `npm install -g remote-iterm` package belongs to the upstream pr
 remote-iterm          # start
 remote-iterm stop     # stop
 remote-iterm restart  # restart
+remote-iterm url      # print the URLs and QR code again
 ```
 
 The launcher prints local and network URLs and a QR code. Open the network URL on a phone connected to the same Wi-Fi network.
