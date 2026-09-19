@@ -2,7 +2,7 @@
 """iTerm2 AutoLaunch supervisor for remote-iterm.
 
 Installed (symlinked) into iTerm2's AutoLaunch folder so the whole remote-iterm
-stack — the phone server (7291), the Vite client (7292), and the state
+stack — the phone server (7291), the web client (7292), and the state
 snapshotter — starts automatically whenever iTerm2 launches, and stops when it
 quits. This is what makes it "no use if I forget to start it" a non-issue.
 
@@ -14,7 +14,7 @@ Design notes:
   its own (already-approved) automation-based auth, exactly as a normal
   ``./iterm-server`` launch from a shell does.
 - Children are started through the user's LOGIN shell so their real PATH (mise /
-  Homebrew node for ``npx vite``) is present, which an AutoLaunch env lacks.
+  Homebrew node for ``npx vite preview``) is present, which an AutoLaunch env lacks.
 - iTerm2 quit is detected two ways: a SIGTERM/SIGINT handler, and a parent-pid
   watch (when iTerm2 dies this script reparents to launchd, ppid -> 1).
 """

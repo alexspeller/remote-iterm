@@ -63,8 +63,9 @@ On first launch, iTerm2 asks for one-time Automation permission so the Python AP
 ### More robust lifecycle
 
 - Creates and updates an isolated Python virtual environment automatically.
-- Tracks both the backend and Vite processes and can recover from stale PID files by checking the listening ports.
-- Runs Python as a background-only process on macOS and refuses to silently start Vite on an unexpected fallback port.
+- Tracks the backend, client, and snapshotter processes and can recover from stale PID files by checking the listening ports.
+- Serves a production build of the client rather than the Vite dev server, so nothing reloads the page from under the user; the build is refreshed on start whenever the client sources changed.
+- Runs Python as a background-only process on macOS and refuses to silently serve the client on an unexpected fallback port.
 - Starts with a scannable QR code and keeps the existing `start`, `stop`, and `restart` CLI workflow.
 - Adds focused unit coverage for styled output, cursor placement, scrollback paging, and bounded client delivery.
 
@@ -83,7 +84,7 @@ For the component model, data flow, Socket.IO contract, and design trade-offs, s
 - Two-session view with an adjustable divider and independent focus
 - Multi-window spatial map
 - Broadcast commands to selected windows
-- Persistent command history with arrow navigation
+- Persistent command history with arrow navigation, and an unsent command that survives a reload
 - Native keyboard direct-input mode and raw terminal keys
 - Quick actions such as Ctrl+C, Escape, arrows, and Tab
 - Clipboard paste and terminal-output copy
@@ -132,7 +133,7 @@ Restore recreates each window/tab/split, `cd`s every pane back to its directory,
 - macOS with iTerm2
 - iTerm2 **Python API enabled** under **Settings → General → Magic → Enable Python API**
 - Python 3.8 or newer (Homebrew `python3` is recommended; the launcher creates its own virtual environment)
-- Node.js 18 or newer (used to serve the Vite client)
+- Node.js 18 or newer (used to build and serve the web client)
 - A phone and Mac on the same trusted Wi-Fi network
 
 ## Run from source
@@ -145,6 +146,8 @@ npm install
 ```
 
 The first launch creates `server/.venv`, installs the Python dependencies, and generates a private shared access key. The QR code and printed URLs include that key in the URL fragment, so the page can be bookmarked without sending the key in the initial HTTP request. Later launches reuse the same key and reinstall dependencies only when `server/requirements.txt` changes.
+
+The launcher also builds the web client into `client/dist` — only when something under `client/` is newer than the last build — and serves that static bundle on port 7292 with `vite preview`. It deliberately does not run the Vite dev server for the phone: the dev server's hot-reload client calls `location.reload()` whenever its WebSocket drops and the server answers again, and on a phone that WebSocket drops every time the screen locks or the page goes to the background, so the page reloaded itself, losing the half-typed command, each time you came back to it. The trade-off is that changes under `client/` need `./iterm-server restart` to show up, just like changes to the Python server. For hot reloading while developing the client, run `npm --prefix client run dev -- --port 7293` and open that port instead.
 
 Once a browser has connected with the key, the server also hands it an HttpOnly cookie (`POST /auth`) that authenticates on its own and is renewed on every connection. Safari deletes a site's `localStorage` after seven days of Safari use without a visit, which is exactly what happens to a phone that only opens remote-iterm from notification taps; the cookie survives that. Each browser context (Safari, a home-screen web app, an in-app browser) has its own storage, so each needs the key once.
 
@@ -167,14 +170,14 @@ mise exec -- server/.venv/bin/python -m unittest \
   server.test_ascii_layout server.test_snapshot server.test_restore
 ```
 
-The snapshot, geometry, ASCII-layout, and restore unit tests are pure Python and need neither a phone nor a running iTerm2.
+The snapshot, geometry, ASCII-layout, and restore unit tests are pure Python and need neither a phone nor a running iTerm2. The client tests run under vitest: the deep-link parsing is pure, and the command-box tests render the real `App` in jsdom with only the socket faked.
 
 The backend requires a running iTerm2 instance and permission to use its Python API for integration testing. The client build and isolated rendering tests do not require a phone.
 
 ## Ports and local files
 
 - `7291` — Python Socket.IO server
-- `7292` — Vite web client
+- `7292` — web client (the static build in `client/dist`, served by `vite preview`)
 - `.iterm-server.pid` — backend and client process IDs
 - `.iterm-server.log` — combined server and client log
 - `server/.venv` — automatically managed Python environment

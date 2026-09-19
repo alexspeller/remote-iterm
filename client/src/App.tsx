@@ -32,6 +32,7 @@ const HISTORY_KEY = 'iterm-cmd-history';
 const ACCESS_KEY_STORAGE_KEY = 'remote-iterm-access-key';
 const SMART_TYPING_KEY = 'remote-iterm-smart-typing';
 const TYPING_LOG_KEY = 'remote-iterm-typing-log';
+const COMMAND_DRAFT_KEY = 'remote-iterm-command-draft';
 const MAX_HISTORY = 100;
 const MAX_TYPING_LOG_CHARS = 20000;
 const BOTTOM_THRESHOLD_PX = 4;
@@ -93,6 +94,15 @@ function loadSmartTyping(): boolean {
 
 function loadTypingLog(): string {
   try { return localStorage.getItem(TYPING_LOG_KEY) || ''; } catch { return ''; }
+}
+
+// The buffered command box is where anything substantial gets composed, and
+// a page reload is not always the user's doing: iOS evicts a background page
+// (and relaunches a home-screen web app) without warning. Whatever has been
+// typed but not yet sent therefore lives in localStorage keystroke by
+// keystroke, and is put back in the box on the next load.
+function loadCommandDraft(): string {
+  try { return localStorage.getItem(COMMAND_DRAFT_KEY) || ''; } catch { return ''; }
 }
 
 // A single rolling string rather than an array of entries: a buffered
@@ -178,7 +188,7 @@ export default function App() {
   const [state, setState] = useState<WindowState[]>([]);
   const [screenSize, setScreenSize] = useState<ScreenSize | null>(null);
   const [content, setContent] = useState<StyledContent | null>(null);
-  const [command, setCommand] = useState('');
+  const [command, setCommand] = useState(loadCommandDraft);
   const [directInputMode, setDirectInputMode] = useState(false);
   const [directInputValue, setDirectInputValue] = useState('');
   const [smartTyping, setSmartTyping] = useState(loadSmartTyping);
@@ -251,6 +261,12 @@ export default function App() {
   useEffect(() => {
     try { localStorage.setItem(TYPING_LOG_KEY, typingLog); } catch {}
   }, [typingLog]);
+  useEffect(() => {
+    try {
+      if (command) localStorage.setItem(COMMAND_DRAFT_KEY, command);
+      else localStorage.removeItem(COMMAND_DRAFT_KEY);
+    } catch {}
+  }, [command]);
 
   useEffect(() => {
     if (!notice) return;

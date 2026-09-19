@@ -13,7 +13,7 @@ Python asyncio service
         ▼
 iTerm2 windows → tabs → sessions (panes)
 
-The phone loads the React client separately from Vite (:7292).
+The phone loads the React client — a static production build — from a separate port (:7292).
 ```
 
 This architecture is the largest departure from the [upstream project](https://github.com/mammadovziya/remote-iterm). Upstream used a Node.js Socket.IO server that invoked AppleScript with `osascript` for iTerm state, terminal content, and commands. It polled content every 150 ms and window state every second. This fork removes that server and talks to iTerm2 through its native Python API from a single `asyncio` event loop.
@@ -28,10 +28,12 @@ The shell launcher owns the local process lifecycle:
 2. Creates `server/.venv` on first use.
 3. Hashes `server/requirements.txt` and installs dependencies only when that hash changes.
 4. Creates a 256-bit shared key on first launch and reuses it from `~/Library/Application Support/remote-iterm/access-key`.
-5. Starts the Python service on port 7291 and Vite on port 7292.
+5. Builds the web client when anything under `client/` is newer than `client/dist`, starts the Python service on port 7291, and serves the built client on port 7292 with `vite preview`.
 6. Stores both process IDs, prints a key-bearing QR code, and exposes `start`, `stop`, and `restart` commands.
-7. Refuses Vite's fallback-port behavior, and on stop waits for both fixed ports to be released before a restart.
+7. Refuses the client server's fallback-port behavior, and on stop waits for both fixed ports to be released before a restart.
 8. Runs the Python service without initializing AppKit, so it remains a background process instead of appearing in the macOS application switcher.
+
+**A build, not the dev server.** The phone is served the production bundle because the Vite dev server's HMR client reloads the page on its own: when its WebSocket closes uncleanly it polls the server and, as soon as the page is visible and the server answers, calls `location.reload()`. On a phone that WebSocket closes every time the screen locks or the page goes to the background, so every return to the page was a reload, and a reload throws away the half-typed command, the pane in view, and the mobile keyboard. The built bundle carries no HMR client, so only the user (or iOS evicting the page) reloads it. The launcher rebuilds when a client source is newer than `client/dist` and keeps serving the previous bundle if that build fails, so a type error cannot take the phone down; the cost is that client changes need `iterm-server restart`, the contract the Python server already had.
 
 ### Python service (`server/server.py`)
 
@@ -68,7 +70,7 @@ The Vite/React client maintains the selected window, tab, and session separately
 - Offers both horizontal tab strips and vertical tab lists for fast selection.
 - Sends all input to the currently focused mobile pane.
 - Provides a direct-input mode that keeps the native mobile keyboard open and forwards text and terminal keys immediately, while retaining the separate buffered command field.
-- Stores command history only in browser `localStorage`.
+- Stores command history, and the not-yet-sent command, only in browser `localStorage`, so a reload the phone did on its own (iOS evicting a background page, or relaunching the home-screen app) does not lose what was being typed.
 - Reconnects indefinitely and measures Socket.IO round-trip latency.
 - Reads the shared key from the URL fragment, remembers it in browser `localStorage`, and sends it in the Socket.IO authentication payload — or connects on the server's HttpOnly cookie alone when it has no key, showing the key prompt only after a refusal. Every successful connection posts to `/auth` to renew that cookie.
 - Resolves a notification deep link (`#session=<id>`, see `client/src/deepLink.ts`) against the first complete state: selects the pane's window, tab, and pane, asks the Mac to focus it, and strips the parameter from the URL so a reload does not jump back.
@@ -81,7 +83,7 @@ An independent process — deliberately separate from the phone server so a bug 
 
 ### AutoLaunch supervisor (`autolaunch/remote-iterm.py`)
 
-A stdlib-only iTerm2 AutoLaunch script (installed via `iterm-snapshot install`) that starts the whole stack — phone server, Vite client, and snapshotter — through the existing `iterm-server` launcher whenever iTerm2 launches, and stops it when iTerm2 quits. It intentionally does not import the iTerm2 API (which would consume the single AutoLaunch `ITERM2_COOKIE` the child processes need) and runs the children through the user's login shell so their real `PATH` (for `npx vite`) is present. iTerm2 quit is detected via a signal handler and a parent-pid watch.
+A stdlib-only iTerm2 AutoLaunch script (installed via `iterm-snapshot install`) that starts the whole stack — phone server, web client, and snapshotter — through the existing `iterm-server` launcher whenever iTerm2 launches, and stops it when iTerm2 quits. It intentionally does not import the iTerm2 API (which would consume the single AutoLaunch `ITERM2_COOKIE` the child processes need) and runs the children through the user's login shell so their real `PATH` (for `npx vite`) is present. iTerm2 quit is detected via a signal handler and a parent-pid watch.
 
 **Startup contract.** `iterm-server start` is slow by design: it holds its lock until the children it spawned are actually listening, so the supervisor's 5s poll queues behind a start in progress instead of racing it. Three rules keep that from turning into a livelock, all of which have failed in practice at least once:
 
@@ -155,4 +157,4 @@ This is bearer-key authentication, not encrypted transport. The subsequent Socke
 
 ## Testing boundaries
 
-`server/test_server.py` covers pure styled-output behavior, scrollback ranges, and latest-wins watcher routing. `npm --prefix client run build` type-checks and bundles the React client. The iTerm2 connection, macOS screen geometry, notifications, and end-to-end phone interaction still require manual integration testing against a running iTerm2 instance.
+`server/test_server.py` covers pure styled-output behavior, scrollback ranges, and latest-wins watcher routing. `npm --prefix client run build` type-checks and bundles the React client. `npm --prefix client test` runs the vitest suite: pure deep-link parsing, and a jsdom render of the real `App` with only the socket faked, which is how the command-draft persistence is checked end to end. The iTerm2 connection, macOS screen geometry, notifications, and end-to-end phone interaction still require manual integration testing against a running iTerm2 instance.

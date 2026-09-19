@@ -1,5 +1,5 @@
 #!/bin/bash
-# Remote iTerm — Python server (7291) + client dev (7292)
+# Remote iTerm — Python server (7291) + built web client (7292)
 
 SOURCE="$0"
 while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
@@ -16,6 +16,8 @@ LOCKDIR="$DIR/.iterm-server.lock"
 VENV="$DIR/server/.venv"
 REQ="$DIR/server/requirements.txt"
 STAMP="$VENV/.requirements.sha"
+CLIENT="$DIR/client"
+CLIENT_DIST="$CLIENT/dist"
 
 # Every wait below is bounded by one of these, and the AutoLaunch supervisor's
 # subprocess timeout (autolaunch/remote-iterm.py START_TIMEOUT) must exceed
@@ -128,6 +130,49 @@ ensure_venv() {
     echo "$want" > "$STAMP"
   fi
   return 0
+}
+
+# True when the built client is missing or older than any of its sources.
+# mtime-based on purpose: a `git pull` or an editor save both bump it, and
+# the build itself writes dist/index.html last, so a successful build is
+# never immediately stale.
+client_needs_build() {
+  [ -f "$CLIENT_DIST/index.html" ] || return 0
+  [ -n "$(find "$CLIENT/src" "$CLIENT/public" "$CLIENT/index.html" \
+               "$CLIENT/vite.config.ts" "$CLIENT/tsconfig.json" \
+               "$CLIENT/tailwind.config.js" "$CLIENT/postcss.config.js" \
+               "$CLIENT/package-lock.json" \
+               -newer "$CLIENT_DIST/index.html" -print -quit 2>/dev/null)" ]
+}
+
+# The phone is served a production build, not the Vite dev server. The dev
+# server's HMR client calls location.reload() whenever its websocket drops
+# and the server answers again — and on a phone that websocket drops every
+# time the screen locks or the page goes to the background, so the page
+# reloaded itself (losing the half-typed command and the pane in view) each
+# time the user came back to it. A built bundle carries no HMR client, so
+# nothing reloads the page but the user. The cost is that client changes need
+# `iterm-server restart`, the same contract the Python server already has.
+#
+# A failed build keeps serving the previous bundle rather than taking the
+# phone down over a type error; only a first build with nothing to fall back
+# on is fatal.
+ensure_client_build() {
+  if [ ! -x "$CLIENT/node_modules/.bin/vite" ]; then
+    echo "  Client dependencies missing — run 'npm install' in $CLIENT" >&2
+    return 1
+  fi
+  client_needs_build || return 0
+  echo "  Building client…"
+  if ( cd "$CLIENT" && npm run build >> "$LOGFILE" 2>&1 ); then
+    return 0
+  fi
+  if [ -f "$CLIENT_DIST/index.html" ]; then
+    echo "  Client build failed — serving the previous build; see $LOGFILE" >&2
+    return 0
+  fi
+  echo "  Client build failed and there is no previous build — see $LOGFILE" >&2
+  return 1
 }
 
 # True if anything is listening on $1. bash's /dev/tcp costs ~0.007s against
@@ -274,10 +319,12 @@ do_start() {
   if [ "$client_up" = 0 ]; then
     if lsof -nP -tiTCP:7292 -sTCP:LISTEN >/dev/null 2>&1; then
       echo "  Client port 7292 is already in use"
-    else
+    elif ensure_client_build; then
       echo "  Starting client…"
-      ( cd "$DIR/client" && exec npx vite --host --port 7292 --strictPort >> "$LOGFILE" 2>&1 ) &
+      ( cd "$CLIENT" && exec npx vite preview --host --port 7292 --strictPort >> "$LOGFILE" 2>&1 ) &
       client_pid=$!
+    else
+      echo "  Client not started" >&2
     fi
   fi
 
