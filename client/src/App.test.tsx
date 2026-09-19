@@ -300,3 +300,45 @@ describe('connection diagnostics', () => {
     })]);
   });
 });
+
+describe('the reconnect banner', () => {
+  it('stays hidden for a brief gap and appears only for a real outage', () => {
+    vi.useFakeTimers();
+    try {
+      render(<App />);
+      act(() => latestSocket().receive('connect', undefined));
+      expect(screen.queryByText('RECONNECTING')).toBeNull();
+
+      act(() => latestSocket().receive('disconnect', 'transport error'));
+      act(() => { vi.advanceTimersByTime(1000); });
+      expect(screen.queryByText('RECONNECTING')).toBeNull();
+
+      act(() => latestSocket().receive('connect', undefined));
+      act(() => { vi.advanceTimersByTime(5000); });
+      expect(screen.queryByText('RECONNECTING')).toBeNull();
+
+      act(() => latestSocket().receive('disconnect', 'transport error'));
+      act(() => { vi.advanceTimersByTime(3000); });
+      expect(screen.getByText('RECONNECTING')).toBeTruthy();
+
+      act(() => latestSocket().receive('connect', undefined));
+      expect(screen.queryByText('RECONNECTING')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('never covers the terminal or the command box', () => {
+    vi.useFakeTimers();
+    try {
+      render(<App />);
+      act(() => { vi.advanceTimersByTime(5000); });
+      const banner = screen.getByRole('status');
+      expect(banner.textContent).toContain('RECONNECTING');
+      expect(banner.classList.contains('pointer-events-none')).toBe(true);
+      expect(banner.classList.contains('inset-0')).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

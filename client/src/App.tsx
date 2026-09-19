@@ -25,6 +25,9 @@ interface StyledContent {
 const ACCENT = '#10b981';
 const BROADCAST_COLOR = '#818cf8';
 const GLOW = 'rgba(16,185,129,0.25)';
+// Reserved for a destructive action that is waiting to be confirmed.
+const DANGER = '#fb7185';
+const DANGER_GLOW = 'rgba(251,113,133,0.3)';
 
 const SOCKET_URL = window.location.hostname === 'localhost'
   ? 'http://localhost:7291'
@@ -38,6 +41,10 @@ const COMMAND_DRAFT_KEY = 'remote-iterm-command-draft';
 const LAST_DISCONNECT_KEY = 'remote-iterm-last-disconnect';
 const MAX_HISTORY = 100;
 const MAX_TYPING_LOG_CHARS = 20000;
+// How long a disconnection may last before the page says so. Reconnects
+// after a network-path blip complete well inside this, so the banner is
+// reserved for an outage the user actually needs to know about.
+const RECONNECT_BANNER_DELAY_MS = 2500;
 const BOTTOM_THRESHOLD_PX = 4;
 const DIRECT_INPUT_KEYS: Record<string, string> = {
   Enter: '\r',
@@ -126,11 +133,42 @@ function isLastDisconnect(value: unknown): value is LastDisconnect {
     && 'visibility' in value && typeof value.visibility === 'string';
 }
 
+// What the transport saw: the raw WebSocket close (its code tells a
+// protocol or data error from a plain lost connection) and how long the
+// socket had been idle in each direction when it died.
+let lastSendAt = 0;
+let lastReceiveAt = 0;
+let lastSocketClose: { code: number; reason: string; wasClean: boolean; at: number } | null = null;
+
+function observeTransport(socket: Socket) {
+  const engine = socket.io?.engine;
+  if (!engine) return;
+  engine.on('packetCreate', () => { lastSendAt = Date.now(); });
+  engine.on('packet', () => { lastReceiveAt = Date.now(); });
+  const watchWebSocket = (transport: unknown) => {
+    const ws: unknown = typeof transport === 'object' && transport !== null ? Reflect.get(transport, 'ws') : null;
+    if (!(ws instanceof WebSocket)) return;
+    ws.addEventListener('close', (event) => {
+      lastSocketClose = { code: event.code, reason: event.reason, wasClean: event.wasClean, at: Date.now() };
+    });
+  };
+  watchWebSocket(engine.transport);
+  engine.on('upgrade', watchWebSocket);
+}
+
 // sessionStorage: survives a reload of this tab, not a new tab, which is
 // exactly the distinction wanted.
 function rememberDisconnect(reason: string) {
+  const now = Date.now();
   try {
-    sessionStorage.setItem(LAST_DISCONNECT_KEY, JSON.stringify({ reason, at: Date.now(), visibility: document.visibilityState }));
+    sessionStorage.setItem(LAST_DISCONNECT_KEY, JSON.stringify({
+      reason,
+      at: now,
+      visibility: document.visibilityState,
+      sinceSendMs: lastSendAt ? now - lastSendAt : null,
+      sinceReceiveMs: lastReceiveAt ? now - lastReceiveAt : null,
+      socketClose: lastSocketClose && now - lastSocketClose.at < 5000 ? lastSocketClose : null,
+    }));
   } catch {}
 }
 
@@ -275,6 +313,9 @@ export default function App() {
   const [splitTabId, setSplitTabId] = useState<string | null>(null);
   const [showSplitMap, setShowSplitMap] = useState(false);
   const [showPaneMap, setShowPaneMap] = useState(false);
+  // Closing a pane kills whatever is running in it, so the map's close button
+  // arms a confirmation rather than acting on the first tap.
+  const [paneCloseArmed, setPaneCloseArmed] = useState(false);
   const [tabListTarget, setTabListTarget] = useState<'tabBar' | 'split' | null>(null);
   // Bumped to re-render the pane map's content thumbnails when cached pane
   // content arrives (cache lives in a ref, so it can't trigger renders itself).
@@ -335,6 +376,10 @@ export default function App() {
   useEffect(() => { splitWinIdRef.current = splitWinId; }, [splitWinId]);
   useEffect(() => { splitTabIdRef.current = splitTabId; }, [splitTabId]);
   useEffect(() => { paneMapOpenRef.current = showPaneMap; }, [showPaneMap]);
+  // An armed confirmation is only ever about the pane on screen right now:
+  // drop it if the map closes, or if the pane it named stops being the
+  // selected one (the Mac can move the selection under us).
+  useEffect(() => { setPaneCloseArmed(false); }, [showPaneMap, selectedSessionId]);
   useEffect(() => {
     try { localStorage.setItem(TYPING_LOG_KEY, typingLog); } catch {}
   }, [typingLog]);
@@ -351,6 +396,18 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [notice]);
 
+  // The reconnect banner waits out the brief gaps; the top-bar dot goes red
+  // at once for anyone who wants to see them.
+  const [reconnectBanner, setReconnectBanner] = useState(false);
+  useEffect(() => {
+    if (connected) {
+      setReconnectBanner(false);
+      return;
+    }
+    const timer = setTimeout(() => setReconnectBanner(true), RECONNECT_BANNER_DELAY_MS);
+    return () => clearTimeout(timer);
+  }, [connected]);
+
   // --- Socket init ---
   useEffect(() => {
     setConnected(false);
@@ -363,8 +420,16 @@ export default function App() {
       withCredentials: true,
       reconnection: true,
       reconnectionAttempts: Infinity,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
+      // A phone's WebSocket dies whenever its network path so much as
+      // flickers (the `hello` diagnostics showed a visible, online page
+      // losing its socket to a transport error every 10-60s over Tailscale).
+      // Reconnecting at once, and straight to WebSocket rather than through
+      // a polling handshake first, keeps the gap short enough that the
+      // banner below never needs to appear for one of those.
+      reconnectionDelay: 250,
+      reconnectionDelayMax: 2000,
+      randomizationFactor: 0.3,
+      rememberUpgrade: true,
       timeout: 10000,
     });
     socketRef.current = s;
@@ -372,6 +437,7 @@ export default function App() {
     s.on('connect', () => {
       setAuthError(false);
       setConnected(true);
+      observeTransport(s);
       s.emit('hello', connectionHello());
       void refreshKeyCookie(accessKey);
     });
@@ -858,6 +924,17 @@ export default function App() {
     if (ids.length) socketRef.current?.emit('getAllContent', { sessionIds: ids });
   };
 
+  // Closes the pane the map has selected — the one drawn in the confirm
+  // colour. The map is dismissed straight after: the tab's layout is about to
+  // change under it, and the server's next state picks the replacement pane.
+  const handleClosePane = () => {
+    const sessionId = selectedSessionId;
+    setPaneCloseArmed(false);
+    setShowPaneMap(false);
+    if (!sessionId) return;
+    socketRef.current?.emit('closePane', { sessionId });
+  };
+
   const loadEarlierContent = (
     pane: 'primary' | 'split',
     sessionId: string | null,
@@ -1081,19 +1158,17 @@ export default function App() {
         </div>
       )}
 
-      {/* ── Reconnect Overlay ── */}
-      {!authError && !connected && (
+      {/* ── Reconnect banner ── */}
+      {/* Non-blocking on purpose: the terminal stays readable and keystrokes
+          typed meanwhile are queued by Socket.IO and sent on reconnect. */}
+      {!authError && reconnectBanner && (
         <div
-          className="fixed inset-0 z-[100] flex flex-col items-center justify-center gap-3 select-none"
-          style={{ backgroundColor: 'rgba(0,0,0,0.9)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)' }}
+          role="status"
+          className="fixed left-1/2 z-[100] flex -translate-x-1/2 items-center gap-2 rounded-full border border-red-500/40 bg-zinc-900/95 px-4 py-1.5 text-[10px] font-bold tracking-[0.15em] text-red-300 shadow-xl select-none pointer-events-none"
+          style={{ top: 'calc(env(safe-area-inset-top, 0px) + 3.25rem)' }}
         >
-          <WifiOff className="w-8 h-8 text-red-400 animate-pulse" />
-          <span className="text-[13px] font-bold tracking-[0.15em] text-zinc-400">RECONNECTING</span>
-          <div className="flex gap-1 mt-1">
-            <div className="w-1.5 h-1.5 rounded-full bg-zinc-600 animate-bounce" style={{ animationDelay: '0ms' }} />
-            <div className="w-1.5 h-1.5 rounded-full bg-zinc-600 animate-bounce" style={{ animationDelay: '150ms' }} />
-            <div className="w-1.5 h-1.5 rounded-full bg-zinc-600 animate-bounce" style={{ animationDelay: '300ms' }} />
-          </div>
+          <WifiOff className="h-3.5 w-3.5 animate-pulse" />
+          RECONNECTING
         </div>
       )}
 
@@ -1370,10 +1445,16 @@ export default function App() {
               const r = pane.rect;
               if (!r) return null;
               const isSel = pane.id === selectedSessionId;
+              const doomed = isSel && paneCloseArmed;
+              const mark = doomed ? DANGER : ACCENT;
               return (
                 <button
                   key={pane.id}
-                  onClick={() => handlePaneSelect(pane.id)}
+                  // While a close is armed the grid stops being a switcher:
+                  // tapping anywhere in it backs out, so a stray tap cannot
+                  // leave the confirmation hanging over a different pane.
+                  onClick={() => paneCloseArmed ? setPaneCloseArmed(false) : handlePaneSelect(pane.id)}
+                  aria-label={`Pane ${idx + 1}${pane.name ? ` ${pane.name}` : ''}`}
                   className="absolute rounded-[5px] border transition-all active:opacity-80 overflow-hidden"
                   style={{
                     left: `calc(${r.x * 100}% + 2px)`,
@@ -1381,16 +1462,16 @@ export default function App() {
                     width: `calc(${r.w * 100}% - 4px)`,
                     height: `calc(${r.h * 100}% - 4px)`,
                     backgroundColor: 'rgba(39,39,42,0.6)',
-                    borderColor: isSel ? ACCENT : '#3f3f46',
+                    borderColor: isSel ? mark : '#3f3f46',
                     borderWidth: isSel ? '2px' : '1px',
-                    boxShadow: isSel ? `0 0 16px ${GLOW}` : 'none',
+                    boxShadow: isSel ? `0 0 16px ${doomed ? DANGER_GLOW : GLOW}` : 'none',
                   }}
                 >
                   <PanePreview content={contentCacheRef.current.get(pane.id)} />
-                  {isSel && <div className="absolute inset-0 pointer-events-none" style={{ backgroundColor: ACCENT + '20' }} />}
+                  {isSel && <div className="absolute inset-0 pointer-events-none" style={{ backgroundColor: mark + '20' }} />}
                   <span
                     className="absolute top-0.5 left-0.5 z-10 flex items-center gap-1 max-w-[calc(100%-4px)] px-1 py-0.5 rounded"
-                    style={{ backgroundColor: isSel ? ACCENT : 'rgba(0,0,0,0.65)' }}
+                    style={{ backgroundColor: isSel ? mark : 'rgba(0,0,0,0.65)' }}
                   >
                     <span className="font-bold leading-none" style={{ fontSize: '11px', color: isSel ? '#000' : ACCENT }}>
                       {idx + 1}
@@ -1746,27 +1827,37 @@ export default function App() {
       )}
 
       {/* ── Quick Actions ── */}
-      <div className={`flex items-center gap-1.5 bg-zinc-950/60 border-t border-zinc-800/40 flex-shrink-0 overflow-x-auto no-scrollbar select-none ${isLandscape ? 'px-2 py-1' : 'px-3 py-2'}`}>
-        <QuickBtn label="ESC" onClick={() => sendSpecialKey('\x1b')} color="#f87171" />
-        <QuickBtn label="^C" onClick={() => sendSpecialKey('\x03')} color="#f87171" />
-        <QuickBtn label="^D" onClick={() => sendSpecialKey('\x04')} color="#fbbf24" />
-        <QuickBtn label="^Z" onClick={() => sendSpecialKey('\x1a')} color="#fbbf24" />
-        <QuickBtn label="^L" onClick={() => sendSpecialKey('\x0c')} color="#38bdf8" />
-        <div className="w-px h-5 bg-zinc-800 mx-1 flex-shrink-0" />
-        <QuickBtn icon={<ChevronUp className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[A')} color="#a78bfa" />
-        <QuickBtn icon={<ChevronDown className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[B')} color="#a78bfa" />
-        <QuickBtn icon={<ChevronLeft className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[D')} color="#a78bfa" />
-        <QuickBtn icon={<ChevronRight className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[C')} color="#a78bfa" />
-        <QuickBtn label="TAB" onClick={() => sendSpecialKey('\t')} color="#818cf8" />
-        {/* Real Return (CR, 0x0D): submits in shells AND raw-mode TUIs like Claude Code */}
-        <QuickBtn icon={<CornerDownLeft className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\r')} color="#34d399" />
-        {/* Newline (LF, 0x0A): the Shift+Enter equivalent — inserts a line without submitting */}
-        <QuickBtn label="⇧↵" onClick={() => sendSpecialKey('\n')} color="#14b8a6" />
-        <div className="w-px h-5 bg-zinc-800 mx-1 flex-shrink-0" />
-        <QuickBtn icon={<Clipboard className="w-3.5 h-3.5" />} onClick={handlePaste} color="#38bdf8" />
-        <QuickBtn icon={<Copy className="w-3.5 h-3.5" />} onClick={handleCopy} color="#71717a" />
-        <QuickBtn icon={<Trash2 className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x15')} color="#fb7185" />
-        <QuickBtn icon={<ScrollText className="w-3.5 h-3.5" />} onClick={() => setShowTypingLog(true)} color="#facc15" />
+      {/* Two fixed rows rather than one scrolling strip. A horizontally
+          scrolled row hides keys behind an edge with nothing to suggest they
+          are there, and swiping it is easy to start by accident while aiming
+          for a key. Every button is flex-1 with a zero basis, so a row divides
+          whatever width the phone has and both rows always fit, portrait or
+          landscape, without a scroll. */}
+      <div className={`flex flex-col bg-zinc-950/60 border-t border-zinc-800/40 flex-shrink-0 select-none ${isLandscape ? 'gap-0.5 px-2 py-1' : 'gap-1 px-3 py-2'}`}>
+        <div className="flex items-center gap-1" role="group" aria-label="Control and arrow keys">
+          <QuickBtn label="ESC" onClick={() => sendSpecialKey('\x1b')} color="#f87171" />
+          <QuickBtn label="^C" onClick={() => sendSpecialKey('\x03')} color="#f87171" />
+          <QuickBtn label="^D" onClick={() => sendSpecialKey('\x04')} color="#fbbf24" />
+          <QuickBtn label="^Z" onClick={() => sendSpecialKey('\x1a')} color="#fbbf24" />
+          <QuickBtn label="^L" onClick={() => sendSpecialKey('\x0c')} color="#38bdf8" />
+          <div className="w-px h-5 bg-zinc-800 mx-0.5 flex-shrink-0" />
+          <QuickBtn title="Up" icon={<ChevronUp className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[A')} color="#a78bfa" />
+          <QuickBtn title="Down" icon={<ChevronDown className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[B')} color="#a78bfa" />
+          <QuickBtn title="Left" icon={<ChevronLeft className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[D')} color="#a78bfa" />
+          <QuickBtn title="Right" icon={<ChevronRight className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x1b[C')} color="#a78bfa" />
+        </div>
+        <div className="flex items-center gap-1" role="group" aria-label="Tab, return and clipboard">
+          <QuickBtn label="TAB" onClick={() => sendSpecialKey('\t')} color="#818cf8" />
+          {/* Real Return (CR, 0x0D): submits in shells AND raw-mode TUIs like Claude Code */}
+          <QuickBtn title="Return" icon={<CornerDownLeft className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\r')} color="#34d399" />
+          {/* Newline (LF, 0x0A): the Shift+Enter equivalent — inserts a line without submitting */}
+          <QuickBtn title="Newline without sending" label="⇧↵" onClick={() => sendSpecialKey('\n')} color="#14b8a6" />
+          <div className="w-px h-5 bg-zinc-800 mx-0.5 flex-shrink-0" />
+          <QuickBtn title="Paste" icon={<Clipboard className="w-3.5 h-3.5" />} onClick={handlePaste} color="#38bdf8" />
+          <QuickBtn title="Copy pane" icon={<Copy className="w-3.5 h-3.5" />} onClick={handleCopy} color="#71717a" />
+          <QuickBtn title="Clear line" icon={<Trash2 className="w-3.5 h-3.5" />} onClick={() => sendSpecialKey('\x15')} color="#fb7185" />
+          <QuickBtn title="Typing log" icon={<ScrollText className="w-3.5 h-3.5" />} onClick={() => setShowTypingLog(true)} color="#facc15" />
+        </div>
       </div>
 
       {/* ── Buffered command / native direct input ── */}
@@ -2118,9 +2209,11 @@ function PaneSwitcher({ panes, selectedId, onSelect, onOpenMap }: {
 }
 
 // --- Quick Action Button ---
-function QuickBtn({ label, icon, onClick, color }: {
+function QuickBtn({ label, icon, title, onClick, color }: {
   label?: string;
   icon?: React.ReactNode;
+  /** Names an icon-only key for VoiceOver and for a desktop tooltip. */
+  title?: string;
   onClick: () => void;
   color: string;
 }) {
@@ -2133,7 +2226,12 @@ function QuickBtn({ label, icon, onClick, color }: {
       // and its keyboard — focused; the click still fires normally.
       onMouseDown={(event) => event.preventDefault()}
       onClick={onClick}
-      className="flex items-center justify-center min-w-[40px] h-[36px] px-2.5 rounded-lg border transition-all active:scale-90 flex-shrink-0"
+      title={title}
+      aria-label={title || label}
+      // flex-1 over a fixed width: the row divides the phone's width between
+      // its keys instead of overflowing it. basis-0 keeps every key in a row
+      // the same size regardless of how wide its label is.
+      className="flex items-center justify-center flex-1 basis-0 min-w-0 h-[36px] px-1 rounded-lg border transition-all active:scale-90 overflow-hidden"
       style={{
         borderColor: color + '30',
         backgroundColor: color + '10',

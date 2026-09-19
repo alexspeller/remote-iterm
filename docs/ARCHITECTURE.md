@@ -48,6 +48,7 @@ The backend runs `python-socketio` on `aiohttp` alongside one iTerm2 API connect
 - Resolve terminal colors through the session's profile and the xterm 256-color palette.
 - Mark links: OSC 8 hyperlinks arrive from iTerm2 per cell; any other web address is found by pattern, after joining soft-wrapped rows so an address that wrapped is one link.
 - Route commands and raw key bytes to a specific session.
+- Log, for every client, the peer address on connect and the Socket.IO disconnect reason and transport on disconnect, plus the client's own `hello` report, so a phone that keeps reconnecting can be diagnosed from the Mac (see [Diagnosing reconnects](#diagnosing-reconnects)).
 
 State changes are pushed when iTerm2 reports them. A two-second synchronization loop covers job-title changes and pure window moves that do not have a suitable notification; serialized state is compared with the last value before anything is emitted.
 
@@ -74,7 +75,8 @@ The Vite/React client maintains the selected window, tab, and session separately
 - Stores command history, and the not-yet-sent command, only in browser `localStorage`, so a reload the phone did on its own (iOS evicting a background page, or relaunching the home-screen app) does not lose what was being typed.
 - Renders linked runs as anchors that open in a new tab, pointing loopback hosts at the Mac's address (`client/src/links.ts`) so a dev server's printed `http://localhost:3000` works from the phone.
 - Keeps terminal text selectable and holds a pane's live updates while a finger is on it or text in it is selected, applying the latest frame once both have ended (see [Links and text selection](#links-and-text-selection)).
-- Reconnects indefinitely and measures Socket.IO round-trip latency.
+- Reconnects indefinitely — at once, and straight to WebSocket (`rememberUpgrade`) — and measures Socket.IO round-trip latency. A disconnection shows as a red dot immediately and as a small non-blocking RECONNECTING banner only after 2.5 s, so the sub-second gaps a phone's network path produces never interrupt reading or typing; Socket.IO queues keystrokes typed meanwhile and sends them on reconnect.
+- Introduces every connection with a `hello` event carrying what only the page knows: a per-load page id and connection counter (a reload versus the same page reconnecting), how the page saw its previous connection end (Socket.IO reason, the raw WebSocket close code, page visibility, time since the last packet each way — kept in `sessionStorage` across a reload), and `navigator.onLine`. The server logs it beside the disconnect reason, transport, and peer address it records itself.
 - Reads the shared key from the URL fragment, remembers it in browser `localStorage`, and sends it in the Socket.IO authentication payload — or connects on the server's HttpOnly cookie alone when it has no key, showing the key prompt only after a refusal. Every successful connection posts to `/auth` to renew that cookie.
 - Resolves a notification deep link (`#session=<id>`, see `client/src/deepLink.ts`) against the first complete state: selects the pane's window, tab, and pane, asks the Mac to focus it, and strips the parameter from the URL so a reload does not jump back.
 
@@ -87,6 +89,8 @@ An independent process — deliberately separate from the phone server so a bug 
 ### AutoLaunch supervisor (`autolaunch/remote-iterm.py`)
 
 A stdlib-only iTerm2 AutoLaunch script (installed via `iterm-snapshot install`) that starts the whole stack — phone server, web client, and snapshotter — through the existing `iterm-server` launcher whenever iTerm2 launches, and stops it when iTerm2 quits. It intentionally does not import the iTerm2 API (which would consume the single AutoLaunch `ITERM2_COOKIE` the child processes need) and runs the children through the user's login shell so their real `PATH` (for `npx vite`) is present. iTerm2 quit is detected via a signal handler and a parent-pid watch.
+
+**Restart evidence.** The supervisor restarts the phone server only after its port has failed `SERVER_DOWN_POLLS` consecutive probes (15 s at the 5 s interval, each probe allowed 2 s), because a restart drops every connected phone and one failed half-second connect is not a dead server: on 2026-09-19 a single miss ran `start`, whose orphan sweep then killed a server whose event loop was demonstrably healthy. The snapshotter check stays immediate, since it is pid-based rather than a network probe.
 
 **Startup contract.** `iterm-server start` is slow by design: it holds its lock until the children it spawned are actually listening, so the supervisor's 5s poll queues behind a start in progress instead of racing it. Three rules keep that from turning into a livelock, all of which have failed in practice at least once:
 
@@ -125,6 +129,17 @@ Links are resolved on the server, where the cells are. iTerm2 reports an OSC 8 h
 OSC 8 hyperlinks do not currently reach the server, through no fault of the API contract: as of iTerm2 3.6.11 (and `master` at 2f85a80), `PTYSession.m`'s `protoStyleForCharacter:externalAttributes:` builds the `ITMURL` message for a hyperlinked cell but never assigns it to the cell style, so `CellStyle.url` is always empty on the wire. A hyperlink whose visible text is itself a web address is still linked by the pattern pass; one with other text (a file name linking to a docs page, say) shows as plain text until iTerm2 attaches the URL. The OSC 8 path here is unit-tested against a faked cell style and needs no change when that happens.
 
 Text selection needed two things. Nothing above the terminal text may carry `user-select: none` — WebKit has not reliably let a descendant's `text` win over an ancestor's `none` — so the chrome opts out element by element instead of the body opting everything out. And the DOM under a selection must hold still: iOS abandons a long-press selection if the DOM changes mid-gesture, and a pane running a spinner redraws several times a second, which made selecting anything in it impossible. While a finger is on a pane, or a selection lives inside it, that pane's incoming frames are kept aside (tagged with their session, so a pane switch cannot flush one pane's output into another) and the latest one is applied when the gesture and the selection have both ended; the top bar shows PAUSED meanwhile. Older-history pages requested by scrolling are not held, since they prepend above the viewport and the scroll position is preserved for them anyway.
+
+## Diagnosing reconnects
+
+Every connection is bracketed in `.iterm-server.log` by `Client connected: <sid> by key|cookie from <peer> (<user agent>)`, the client's `hello <sid>: {...}` report, and `Client disconnected: <sid> (<reason>, <transport>)`. Read them together:
+
+- `reason` is python-socketio's: `ping timeout` is a stalled path, `transport close` the network or OS closing the socket, `client disconnect` the page letting go, `server disconnect` this server.
+- `hello.page` and `hello.connect` tell a fresh page load (new id) from the same page reconnecting (same id, counter +1); `hello.navigation` is `reload` for a user refresh.
+- `hello.lastDisconnect` is the page's own view of how the previous connection ended: Socket.IO's reason (`transport error` is the WebSocket erroring under a visible page), `visibility` at that moment (`hidden` means the page was suspended — a lock or an app switch, not a network fault), `socketClose.code` (1006 is an abnormal TCP loss; 1002/1007/1009 are protocol, data, or size errors that implicate the framing or compression layer rather than the network), and `sinceSendMs`/`sinceReceiveMs`.
+- The peer address separates the LAN path (192.168.x) from the tailnet one (100.x). python-engineio's aiohttp driver fills `REMOTE_ADDR` with a constant 127.0.0.1, so the server reads the address from the aiohttp request instead.
+
+`REMOTE_ITERM_WS_COMPRESSION=0` in the server's environment turns off WebSocket permessage-deflate (aiohttp negotiates it by default; python-engineio does not expose the flag, so the server swaps in a `WebSocketResponse` built with `compress=False`). It exists to test whether a client's WebSocket errors come from the compression layer, at about four times the bytes per live frame.
 
 ## Pane geometry
 

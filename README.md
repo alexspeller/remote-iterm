@@ -91,7 +91,7 @@ For the component model, data flow, Socket.IO contract, and design trade-offs, s
 - Quick actions such as Ctrl+C, Escape, arrows, and Tab
 - Clipboard paste and terminal-output copy
 - Landscape layout and iPhone safe-area handling
-- Connection latency indicator and automatic reconnect
+- Connection latency indicator and instant, quiet automatic reconnect (a banner only if the outage outlasts a couple of seconds)
 - Screen wake lock, scroll lock, and optional completion vibration
 - Installable PWA
 - Continuous state snapshots for crash recovery, with an ASCII layout map and one-command restore
@@ -181,7 +181,7 @@ The backend requires a running iTerm2 instance and permission to use its Python 
 - `7291` — Python Socket.IO server
 - `7292` — web client (the static build in `client/dist`, served by `vite preview`)
 - `.iterm-server.pid` — backend and client process IDs
-- `.iterm-server.log` — combined server and client log
+- `.iterm-server.log` — combined server and client log, including every client's connect peer, disconnect reason, and the client's own `hello` report of how its previous connection ended (see [Diagnosing reconnects](docs/ARCHITECTURE.md#diagnosing-reconnects))
 - `server/.venv` — automatically managed Python environment
 - `~/Library/Application Support/remote-iterm/access-key` — generated shared key (`0600` permissions)
 - `~/Library/Application Support/remote-iterm/snapshots/` — live `latest/`, per-session `sessions/` archives (with content), and 14-day `history/`

@@ -34,6 +34,13 @@ LOG_PATH = (Path.home() / "Library" / "Application Support" / "remote-iterm"
             / "snapshots" / "supervisor.log")
 CHECK_INTERVAL = 5.0
 SERVER_PORT = 7291
+# A restart drops every connected phone, so it takes sustained evidence:
+# the port must fail this many consecutive probes (CHECK_INTERVAL apart)
+# first. One failed half-second connect is not a dead server — on
+# 2026-09-19 a lone miss ran `start`, whose orphan sweep then killed a
+# server whose event loop was demonstrably healthy.
+SERVER_DOWN_POLLS = 3
+PROBE_TIMEOUT = 2.0
 # Must exceed iterm-server's own worst case (LOCK_WAIT_SECONDS +
 # SERVER_START_SECONDS + CLIENT_START_SECONDS, plus venv/auth overhead). When
 # this kill lands mid-start instead, the shell dies without running the
@@ -78,7 +85,7 @@ def _run(action: str) -> None:
 def _server_up() -> bool:
     import socket
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.5)
+        s.settimeout(PROBE_TIMEOUT)
         return s.connect_ex(("127.0.0.1", SERVER_PORT)) == 0
 
 
@@ -126,6 +133,7 @@ def main() -> None:
     log(f"supervisor starting (repo={REPO}, ppid={_original_ppid})")
     _run("start")
 
+    down_polls = 0
     while True:
         time.sleep(CHECK_INTERVAL)
         # iTerm2 has quit: our launcher parent died and we reparented to launchd.
@@ -137,11 +145,13 @@ def main() -> None:
         # calling it here always repairs exactly what's missing without
         # disturbing whatever is still healthy.
         server_ok = _server_up()
+        down_polls = 0 if server_ok else down_polls + 1
         snapshot_ok = _snapshot_up()
-        if not server_ok or not snapshot_ok:
-            log("server port down — restarting stack" if not server_ok else
-                "snapshotter died — restarting stack")
+        if down_polls >= SERVER_DOWN_POLLS or not snapshot_ok:
+            log(f"server port down for {down_polls} probes — restarting stack"
+                if not server_ok else "snapshotter died — restarting stack")
             _run("start")
+            down_polls = 0
 
 
 if __name__ == "__main__":

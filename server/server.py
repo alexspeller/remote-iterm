@@ -11,6 +11,7 @@ client.
 """
 import asyncio
 import ctypes
+import functools
 import json
 import os
 import re
@@ -24,6 +25,7 @@ import iterm2
 import iterm2.rpc
 import socketio
 from aiohttp import web
+import engineio.async_drivers.aiohttp as engineio_aiohttp
 
 try:
     from .auth import (
@@ -112,6 +114,16 @@ def _origin_allowed(origin, environ) -> bool:
     # with 400 and skips the check when there is no Origin header at all.
     return is_trusted_origin(origin, environ.get("HTTP_HOST"))
 
+
+# aiohttp negotiates permessage-deflate on every WebSocket by default and
+# python-engineio builds its WebSocketResponse without exposing the flag.
+# REMOTE_ITERM_WS_COMPRESSION=0 turns it off: the switch for testing whether
+# a phone's WebSocket errors come from the compression layer rather than the
+# network, at the cost of ~4x the bytes per live frame.
+WEBSOCKET_COMPRESSION = os.environ.get("REMOTE_ITERM_WS_COMPRESSION", "1") != "0"
+if not WEBSOCKET_COMPRESSION:
+    engineio_aiohttp.WebSocketResponse = functools.partial(
+        web.WebSocketResponse, compress=False)
 
 sio = socketio.AsyncServer(async_mode="aiohttp", cors_allowed_origins=_origin_allowed)
 
@@ -1145,6 +1157,27 @@ async def on_split_pane(sid, data):
     await push_state()
 
 
+@sio.on("closePane")
+async def on_close_pane(sid, data):
+    # Deliberately not resolve_session: that falls back to whatever iTerm has
+    # focused when the id is unknown, which for a destructive call means a
+    # stale id closes the wrong pane. An id we cannot find is a pane that has
+    # already gone, so there is nothing to do.
+    session_id = (data or {}).get("sessionId")
+    session = itermapp.get_session_by_id(session_id) if (itermapp and session_id) else None
+    if session is None:
+        return
+    try:
+        # force=True because the phone has already asked. Without it iTerm
+        # runs closeSessionWithConfirmation:, which puts a modal alert on the
+        # Mac for any pane with a running job — nobody is at the Mac to answer
+        # it, and it blocks iTerm's main thread, and with it the whole API.
+        await session.async_close(force=True)
+    except Exception as err:
+        log(f"close pane failed: {err}")
+    await push_state()
+
+
 @sio.on("renameSession")
 async def on_rename_session(sid, data):
     session_id = data.get("sessionId")
@@ -1273,7 +1306,8 @@ async def main() -> None:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log(f"Server running on http://0.0.0.0:{PORT}")
+    log(f"Server running on http://0.0.0.0:{PORT} "
+        f"(websocket compression {'on' if WEBSOCKET_COMPRESSION else 'off'})")
 
     # `stop` is shared by three independent triggers: a real shutdown signal,
     # connection_watchdog's periodic probe, and the exception handler below
