@@ -454,6 +454,17 @@ do_restart() {
   do_start
 }
 
+# Every invocation is recorded with its caller, so a stack that keeps getting
+# restarted can be traced to whoever is doing it (`ps` on the parent pid).
+log_invocation() {
+  local parent
+  parent="$(ps -o command= -p "$PPID" 2>/dev/null | cut -c1-160)"
+  printf '%s launcher: %s by pid %s (parent %s: %s) tty=%s\n' \
+    "$(date +%Y-%m-%dT%H:%M:%S)" "${1:-start}" "$$" "$PPID" "${parent:-?}" "$(tty 2>/dev/null || echo none)" \
+    >> "$LOGFILE"
+}
+log_invocation "$1"
+
 case "${1:-start}" in
   start)   with_lock do_start ;;
   stop)    with_lock do_stop ;;
