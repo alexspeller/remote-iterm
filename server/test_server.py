@@ -9,8 +9,11 @@ import server.server as server_module
 from server.auth import COOKIE_MAX_AGE, COOKIE_NAME
 from server.server import (
     _DEFAULT_PALETTE,
+    _apply_links,
+    _autolink,
     _content_line_range,
     _line_runs,
+    _link_ranges,
     clients,
     delivery_wakeups,
     last_content,
@@ -30,20 +33,42 @@ class _DefaultColor:
     is_standard = False
 
 
+class _URL:
+    """iterm2.CellStyle.URL double: an OSC 8 hyperlink on a cell."""
+
+    def __init__(self, url):
+        self.url = url
+        self.identifier = None
+
+
 class _Style:
-    def __init__(self, *, faint=False):
+    def __init__(self, *, faint=False, url=None):
         self.fg_color = _DefaultColor()
         self.bg_color = _DefaultColor()
         self.bold = False
         self.faint = faint
         self.inverse = False
+        self.url = _URL(url) if url else None
 
 
 class _Line:
-    def __init__(self, text, faint_at=()):
+    """iterm2.LineContents double. ``linked`` maps a (start, end) slice of
+    the text to the OSC 8 URL its cells carry; ``hard_eol`` False means
+    iTerm2 wrapped this row onto the next one."""
+
+    def __init__(self, text, faint_at=(), linked=None, hard_eol=True):
         self.text = text
+        self.string = text
+        self.hard_eol = hard_eol
         faint_at = set(faint_at)
-        self.styles = [_Style(faint=i in faint_at) for i in range(len(text))]
+        url_at = {}
+        for (start, end), url in (linked or {}).items():
+            for i in range(start, end):
+                url_at[i] = url
+        self.styles = [
+            _Style(faint=i in faint_at, url=url_at.get(i))
+            for i in range(len(text))
+        ]
 
     def style_at(self, index):
         return self.styles[index] if index < len(self.styles) else None
@@ -70,6 +95,79 @@ class LineRunsTest(unittest.TestCase):
             _line_runs(_Line("ab", faint_at={1}), _DEFAULT_PALETTE),
             [{"t": "a"}, {"t": "b", "d": True}],
         )
+
+    def test_osc8_hyperlink_is_its_own_run(self):
+        line = _Line("see docs now", linked={(4, 8): "https://example.org/docs"})
+        self.assertEqual(
+            _line_runs(line, _DEFAULT_PALETTE),
+            [{"t": "see "}, {"t": "docs", "u": "https://example.org/docs"},
+             {"t": " now"}],
+        )
+
+    def test_osc8_links_a_phone_cannot_open_stay_plain_text(self):
+        line = _Line("notes.txt", linked={(0, 9): "file:///Users/alex/notes.txt"})
+        self.assertEqual(_line_runs(line, _DEFAULT_PALETTE), [{"t": "notes.txt"}])
+
+
+class AutolinkTest(unittest.TestCase):
+    def test_links_a_web_address_inside_a_styled_run(self):
+        text = "see https://a.b/c now"
+        self.assertEqual(
+            _apply_links([{"t": text, "b": True}], _link_ranges(text)),
+            [{"t": "see ", "b": True},
+             {"t": "https://a.b/c", "b": True, "u": "https://a.b/c"},
+             {"t": " now", "b": True}],
+        )
+
+    def test_trailing_punctuation_and_brackets_stay_outside_the_link(self):
+        self.assertEqual(
+            _link_ranges("(see https://x.y/z?q=1)."),
+            [(5, 22, "https://x.y/z?q=1")],
+        )
+        self.assertEqual(_link_ranges("Visit HTTPS://Example.com, then"),
+                         [(6, 25, "HTTPS://Example.com")])
+        self.assertEqual(_link_ranges("no links: ftp://x.y or example.com"), [])
+
+    def test_a_link_across_styled_runs_keeps_each_style(self):
+        text = "https://a.b/c"
+        self.assertEqual(
+            _apply_links([{"t": "https://a.b", "f": "#ff0000"}, {"t": "/c", "d": True}],
+                         _link_ranges(text)),
+            [{"t": "https://a.b", "f": "#ff0000", "u": text},
+             {"t": "/c", "d": True, "u": text}],
+        )
+
+    def test_keeps_the_cursor_where_it_was(self):
+        text = "https://a.b/c"
+        self.assertEqual(
+            _apply_links([{"t": "https://a."}, {"t": "", "c": True}, {"t": "b/c"}],
+                         _link_ranges(text)),
+            [{"t": "https://a.", "u": text}, {"t": "", "c": True},
+             {"t": "b/c", "u": text}],
+        )
+
+    def test_an_osc8_link_is_not_overridden_by_the_address_it_shows(self):
+        runs = [{"t": "https://a.b/c", "u": "https://explicit.example/"}]
+        self.assertEqual(_apply_links(runs, _link_ranges("https://a.b/c")), runs)
+
+    def test_joins_soft_wrapped_rows_into_one_link(self):
+        url = "https://example.com/very/long/path"
+        lines = [_Line("open https://example.com/ver", hard_eol=False),
+                 _Line("y/long/path now")]
+        rendered = [_line_runs(line, _DEFAULT_PALETTE) for line in lines]
+        _autolink(rendered, lines)
+        self.assertEqual(rendered, [
+            [{"t": "open "}, {"t": "https://example.com/ver", "u": url}],
+            [{"t": "y/long/path", "u": url}, {"t": " now"}],
+        ])
+
+    def test_a_hard_newline_ends_the_address(self):
+        lines = [_Line("https://a.b/c"), _Line("d")]
+        rendered = [_line_runs(line, _DEFAULT_PALETTE) for line in lines]
+        _autolink(rendered, lines)
+        self.assertEqual(rendered, [
+            [{"t": "https://a.b/c", "u": "https://a.b/c"}], [{"t": "d"}],
+        ])
 
 
 class _LineInfo:
@@ -157,6 +255,28 @@ class ReadContentTransactionSafetyTest(unittest.IsolatedAsyncioTestCase):
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
+
+
+class ReadContentLinksTest(unittest.IsolatedAsyncioTestCase):
+    """read_content wires the link pass in: an address printed across a
+    soft wrap reaches the client as one link on both rows."""
+
+    def tearDown(self):
+        palette_cache.clear()
+
+    async def test_wrapped_address_is_one_link_across_rows(self):
+        session = _FakeSession([
+            _Line("open https://example.com/very/lo", hard_eol=False),
+            _Line("ng/path now"),
+        ])
+        with patch.object(server_module, "itermapp", _FakeApp(session)):
+            result = await read_content("session-1")
+
+        url = "https://example.com/very/long/path"
+        self.assertEqual(result["lines"], [
+            [{"t": "open "}, {"t": "https://example.com/very/lo", "u": url}],
+            [{"t": "ng/path", "u": url}, {"t": " now"}],
+        ])
 
 
 async def _spin_until(predicate, max_iterations=20_000):

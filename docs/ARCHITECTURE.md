@@ -46,6 +46,7 @@ The backend runs `python-socketio` on `aiohttp` alongside one iTerm2 API connect
 - Read a bounded live tail for watched sessions and encode it as compact styled runs.
 - Page older scrollback from iTerm only when the client approaches the top of its currently loaded history.
 - Resolve terminal colors through the session's profile and the xterm 256-color palette.
+- Mark links: OSC 8 hyperlinks arrive from iTerm2 per cell; any other web address is found by pattern, after joining soft-wrapped rows so an address that wrapped is one link.
 - Route commands and raw key bytes to a specific session.
 
 State changes are pushed when iTerm2 reports them. A two-second synchronization loop covers job-title changes and pure window moves that do not have a suitable notification; serialized state is compared with the last value before anything is emitted.
@@ -71,6 +72,8 @@ The Vite/React client maintains the selected window, tab, and session separately
 - Sends all input to the currently focused mobile pane.
 - Provides a direct-input mode that keeps the native mobile keyboard open and forwards text and terminal keys immediately, while retaining the separate buffered command field.
 - Stores command history, and the not-yet-sent command, only in browser `localStorage`, so a reload the phone did on its own (iOS evicting a background page, or relaunching the home-screen app) does not lose what was being typed.
+- Renders linked runs as anchors that open in a new tab, pointing loopback hosts at the Mac's address (`client/src/links.ts`) so a dev server's printed `http://localhost:3000` works from the phone.
+- Keeps terminal text selectable and holds a pane's live updates while a finger is on it or text in it is selected, applying the latest frame once both have ended (see [Links and text selection](#links-and-text-selection)).
 - Reconnects indefinitely and measures Socket.IO round-trip latency.
 - Reads the shared key from the URL fragment, remembers it in browser `localStorage`, and sends it in the Socket.IO authentication payload — or connects on the server's HttpOnly cookie alone when it has no key, showing the key prompt only after a refusal. Every successful connection posts to `/auth` to renew that cookie.
 - Resolves a notification deep link (`#session=<id>`, see `client/src/deepLink.ts`) against the first complete state: selects the pane's window, tab, and pane, asks the Mac to focus it, and strips the parameter from the URL so a reload does not jump back.
@@ -113,7 +116,15 @@ The protocol intentionally evolves the upstream event names where possible so th
 | client → server | `focus` | Activate an iTerm window and tab on the Mac, or a specific pane when `sessionId` is given |
 | bidirectional ack | `ping` | Measure application-level round-trip latency |
 
-Styled terminal content is run-length encoded. Each run uses `t` for text and may include `f` (foreground), `g` (background), `b` (bold), `d` (faint), or `c` (cursor). Omitted colors inherit the pane's default `fg` and `bg` values.
+Styled terminal content is run-length encoded. Each run uses `t` for text and may include `f` (foreground), `g` (background), `b` (bold), `d` (faint), `c` (cursor), or `u` (the address the run links to). Omitted colors inherit the pane's default `fg` and `bg` values.
+
+## Links and text selection
+
+Links are resolved on the server, where the cells are. iTerm2 reports an OSC 8 hyperlink on each cell it covers (`CellStyle.url`), so the link becomes part of the run key and its boundaries survive run-length grouping. Plain addresses are matched with xterm.js's web-links pattern over the line's text and the runs are split at the match boundaries, keeping each piece's style; an explicit OSC 8 link is never overridden by the address it happens to show. iTerm2 wraps a long line onto the following rows and reports each row with `hard_eol` false, so the rows of one logical line are joined before matching and an address that wrapped mid-way is one link on every row it spans. Only `http` and `https` addresses become links: `file://` links (which `ls --hyperlink` emits) and app schemes point at the Mac and would be dead taps on a phone. The client renders a linked run as an anchor opening in a new tab and rewrites loopback hosts to the address the page was loaded from.
+
+OSC 8 hyperlinks do not currently reach the server, through no fault of the API contract: as of iTerm2 3.6.11 (and `master` at 2f85a80), `PTYSession.m`'s `protoStyleForCharacter:externalAttributes:` builds the `ITMURL` message for a hyperlinked cell but never assigns it to the cell style, so `CellStyle.url` is always empty on the wire. A hyperlink whose visible text is itself a web address is still linked by the pattern pass; one with other text (a file name linking to a docs page, say) shows as plain text until iTerm2 attaches the URL. The OSC 8 path here is unit-tested against a faked cell style and needs no change when that happens.
+
+Text selection needed two things. Nothing above the terminal text may carry `user-select: none` — WebKit has not reliably let a descendant's `text` win over an ancestor's `none` — so the chrome opts out element by element instead of the body opting everything out. And the DOM under a selection must hold still: iOS abandons a long-press selection if the DOM changes mid-gesture, and a pane running a spinner redraws several times a second, which made selecting anything in it impossible. While a finger is on a pane, or a selection lives inside it, that pane's incoming frames are kept aside (tagged with their session, so a pane switch cannot flush one pane's output into another) and the latest one is applied when the gesture and the selection have both ended; the top bar shows PAUSED meanwhile. Older-history pages requested by scrolling are not held, since they prepend above the viewport and the scroll position is preserved for them anyway.
 
 ## Pane geometry
 
@@ -157,4 +168,4 @@ This is bearer-key authentication, not encrypted transport. The subsequent Socke
 
 ## Testing boundaries
 
-`server/test_server.py` covers pure styled-output behavior, scrollback ranges, and latest-wins watcher routing. `npm --prefix client run build` type-checks and bundles the React client. `npm --prefix client test` runs the vitest suite: pure deep-link parsing, and a jsdom render of the real `App` with only the socket faked, which is how the command-draft persistence is checked end to end. The iTerm2 connection, macOS screen geometry, notifications, and end-to-end phone interaction still require manual integration testing against a running iTerm2 instance.
+`server/test_server.py` covers pure styled-output behavior, scrollback ranges, and latest-wins watcher routing. `npm --prefix client run build` type-checks and bundles the React client. `npm --prefix client test` runs the vitest suite: pure deep-link parsing and link rewriting, and a jsdom render of the real `App` with only the socket faked, which is how the command-draft persistence, link rendering, and the selection hold are checked end to end. The iTerm2 connection, macOS screen geometry, notifications, and end-to-end phone interaction still require manual integration testing against a running iTerm2 instance.

@@ -13,6 +13,7 @@ import asyncio
 import ctypes
 import json
 import os
+import re
 import resource
 import signal
 import sys
@@ -452,8 +453,27 @@ def _resolve(color, pal) -> str | None:
     return None  # alternate / default
 
 
+# Only web addresses become links: the phone can open those, whereas the
+# file:// links `ls --hyperlink` emits, or app-specific schemes, point at the
+# Mac and would be dead taps on a phone.
+_LINK_SCHEMES = ("http://", "https://")
+
+
+def _cell_link(style) -> str | None:
+    """The OSC 8 hyperlink on a cell, if it is one a phone can open."""
+    url = style.url
+    if url is None:
+        return None
+    target = url.url
+    return target if target.lower().startswith(_LINK_SCHEMES) else None
+
+
 def _line_runs(line, pal, cursor_x: int | None = None) -> list:
-    """Group a line into styled runs, optionally marking its cursor cell."""
+    """Group a line into styled runs, optionally marking its cursor cell.
+
+    A run also carries ``u`` when its cells are hyperlinked (OSC 8), so
+    the link boundaries survive the run-length grouping.
+    """
     runs: list = []
     cur = None
     buf = ""
@@ -474,7 +494,7 @@ def _line_runs(line, pal, cursor_x: int | None = None) -> list:
         bg = _resolve(style.bg_color, pal)
         if style.inverse:
             fg, bg = (bg or pal["bg"]), (fg or pal["fg"])
-        key = (fg, bg, bool(style.bold), bool(style.faint))
+        key = (fg, bg, bool(style.bold), bool(style.faint), _cell_link(style))
         if key != cur:
             if buf:
                 runs.append(_make_run(cur, buf))
@@ -499,7 +519,7 @@ def _line_runs(line, pal, cursor_x: int | None = None) -> list:
 
 
 def _make_run(key, text: str) -> dict:
-    fg, bg, bold, dim = key
+    fg, bg, bold, dim, link = key
     run = {"t": text}
     if fg:
         run["f"] = fg
@@ -509,7 +529,88 @@ def _make_run(key, text: str) -> dict:
         run["b"] = True
     if dim:
         run["d"] = True
+    if link:
+        run["u"] = link
     return run
+
+
+# Anything that spells out a web address is linked too, since most tools
+# print plain URLs rather than OSC 8 hyperlinks. The pattern is xterm.js's
+# web-links one: a scheme, a body of anything but whitespace and obvious
+# delimiters, ending on a character that is not trailing punctuation — so
+# "(see https://x.y/z)." links exactly https://x.y/z.
+_URL_RE = re.compile(
+    r"""https?://[^\s"'!*(){}|\\^<>`]*[^\s"':,.!?{}|\\^~\[\]`()<>]""",
+    re.IGNORECASE)
+
+
+def _link_ranges(text: str) -> list:
+    """(start, end, url) for every web address in ``text``, in order."""
+    return [(m.start(), m.end(), m.group(0)) for m in _URL_RE.finditer(text)]
+
+
+def _apply_links(runs: list, links: list) -> list:
+    """Split a line's runs at link boundaries and tag the pieces with ``u``.
+
+    ``links`` are (start, end, url) character ranges over the line's text,
+    which the runs' ``t`` values spell out in order — except the zero-width
+    cursor run, which occupies no characters and is passed through where it
+    sits. A run already hyperlinked by OSC 8 keeps the explicit link.
+    """
+    if not links:
+        return runs
+    out: list = []
+    pos = 0
+    for run in runs:
+        text = run["t"]
+        end = pos + len(text)
+        if run.get("c") or "u" in run or not text:
+            out.append(run)
+            pos = end
+            continue
+        cut = pos
+        for start, stop, url in links:
+            lo, hi = max(start, pos), min(stop, end)
+            if lo >= hi:
+                continue
+            if lo > cut:
+                out.append({**run, "t": text[cut - pos:lo - pos]})
+            out.append({**run, "t": text[lo - pos:hi - pos], "u": url})
+            cut = hi
+        if cut < end:
+            out.append({**run, "t": text[cut - pos:]})
+        pos = end
+    return out
+
+
+def _autolink(rendered: list, lines) -> None:
+    """Link the web addresses in a page of rendered lines, in place.
+
+    iTerm2 wraps a long line onto the following rows and reports each row
+    with ``hard_eol`` False, so the rows of one logical line are joined
+    before matching and an address that wrapped mid-way is one link on
+    every row it spans. The page boundary cuts a logical line off, which
+    can only ever shorten a link, never invent one.
+    """
+    texts = [line.string.replace("\x00", " ") for line in lines]
+    start = 0
+    while start < len(lines):
+        stop = start
+        while stop < len(lines) - 1 and not lines[stop].hard_eol:
+            stop += 1
+        matches = _link_ranges("".join(texts[start:stop + 1]))
+        offset = 0
+        for i in range(start, stop + 1):
+            length = len(texts[i])
+            local = [
+                (max(s, offset) - offset, min(e, offset + length) - offset, url)
+                for s, e, url in matches
+                if s < offset + length and e > offset
+            ]
+            if local:
+                rendered[i] = _apply_links(rendered[i], local)
+            offset += length
+        start = stop + 1
 
 
 def _content_line_range(
@@ -572,6 +673,7 @@ async def read_content(
             _line_runs(line, pal, cursor.x if first + i == cursor.y else None)
             for i, line in enumerate(lines)
         ]
+        _autolink(rendered, lines)
         return {
             "lines": rendered, "fg": pal["fg"], "bg": pal["bg"],
             "firstLine": first, "availableFirstLine": available_first,

@@ -6,12 +6,14 @@
   color-scheme: dark;
 }
 
+/* No ancestor of the terminal text may carry user-select: none — WebKit
+   has not reliably let a descendant's `text` win over that — so the chrome
+   opts out element by element (Tailwind's select-none in App.tsx) instead
+   of the body opting everything out. */
 body {
   margin: 0;
   padding: 0;
   -webkit-touch-callout: none;
-  -webkit-user-select: none;
-  user-select: none;
   overflow: hidden;
   position: fixed;
   width: 100%;

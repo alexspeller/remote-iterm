@@ -78,6 +78,8 @@ For the component model, data flow, Socket.IO contract, and design trade-offs, s
 - Machine-stable shared-key authentication through QR and bookmarked URLs, kept alive by an HttpOnly cookie so a phone that only ever arrives via notification links keeps working
 - Notification deep links: `#session=<iTerm session id>` opens that pane and focuses it on the Mac
 - Visible cursor, bold, faint, inverse, and background styles
+- Tappable links: any printed web address (joined across wrapped rows), with `localhost` addresses pointed back at the Mac; OSC 8 hyperlinks are handled too, but iTerm2's API does not export them yet (see [Architecture](docs/ARCHITECTURE.md#links-and-text-selection))
+- Selectable terminal text; live updates for a pane pause while a finger is on it or text in it is selected
 - Tab creation, closing, selection, and long-press rename
 - Horizontal tab strips with a touch-friendly vertical tab picker
 - Spatial split-pane switcher with live previews

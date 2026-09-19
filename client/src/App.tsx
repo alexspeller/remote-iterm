@@ -4,12 +4,14 @@ import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight
 
 import type { Session, Tab, WindowState, ScreenSize } from './types';
 import { deepLinkSessionId, findSessionLocation, stripDeepLink } from './deepLink';
+import { linkHref } from './links';
 
 // --- Types ---
 
 // A run of text sharing one style: t=text, f=fg hex, g=bg hex, b=bold, d=dim.
 // f/g omitted means "use the pane default" (theme fg/bg).
-interface Run { t: string; f?: string; g?: string; b?: boolean; d?: boolean; c?: boolean }
+// u is a link target: an OSC 8 hyperlink, or a web address the server found.
+interface Run { t: string; f?: string; g?: string; b?: boolean; d?: boolean; c?: boolean; u?: string }
 interface StyledContent {
   lines: Run[][];
   fg: string;
@@ -248,6 +250,21 @@ export default function App() {
   // The pane a notification deep link asks for, until the first state tells us
   // where it is (or that it is gone). Survives a key prompt in between.
   const pendingDeepLinkRef = useRef<string | null>(deepLinkSessionId(window.location.hash));
+  // Live updates for a pane are held back while a finger is on it or text in
+  // it is selected, and applied once both have ended. iOS abandons a
+  // long-press text selection if the DOM under it changes mid-gesture, and a
+  // selection that does survive drifts as lines are replaced beneath it; a
+  // pane running a spinner redraws several times a second, which made
+  // selecting anything in it impossible. The held frame remembers which
+  // session it belongs to, so switching panes mid-selection cannot flush
+  // one pane's output into another.
+  const touchingRef = useRef({ primary: false, split: false });
+  const holdRef = useRef({ primary: false, split: false });
+  const heldContentRef = useRef<{
+    primary: { sessionId: string; content: StyledContent } | null;
+    split: { sessionId: string; content: StyledContent } | null;
+  }>({ primary: null, split: null });
+  const [selectionHold, setSelectionHold] = useState(false);
 
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => { winIdRef.current = selectedWinId; }, [selectedWinId]);
@@ -380,12 +397,14 @@ export default function App() {
         if (paneMapOpenRef.current) setPreviewTick(t => t + 1);
         // Update split pane if this is the split session
         if (data.sessionId === splitSessionIdRef.current) {
-          setSplitContent(merged);
+          if (holdRef.current.split) heldContentRef.current.split = { sessionId: data.sessionId, content: merged };
+          else setSplitContent(merged);
         }
         // Only update main content if it's the pane we're viewing (which may be
         // any pane in the selected tab, not just the first).
         if (data.sessionId !== selectedSessionIdRef.current) return;
-        setContent(merged);
+        if (holdRef.current.primary) heldContentRef.current.primary = { sessionId: data.sessionId, content: merged };
+        else setContent(merged);
       } else {
         setContent(styled);
       }
@@ -462,6 +481,47 @@ export default function App() {
       window.removeEventListener('hashchange', consume);
       window.removeEventListener('pageshow', consume);
     };
+  }, []);
+
+  const hasSelectionIn = (element: HTMLElement | null): boolean => {
+    const selection = document.getSelection();
+    if (!element || !selection || selection.isCollapsed || selection.rangeCount === 0) return false;
+    return element.contains(selection.anchorNode) && element.contains(selection.focusNode);
+  };
+
+  // Recompute whether a pane's live updates are on hold, and apply whatever
+  // arrived meanwhile once nothing holds it any more. Only touches refs and
+  // state setters, so the copy captured by the listeners below stays correct.
+  const reconcileHold = (pane: 'primary' | 'split') => {
+    const element = pane === 'primary' ? contentRef.current : splitContentRef.current;
+    const hold = touchingRef.current[pane] || hasSelectionIn(element);
+    holdRef.current[pane] = hold;
+    if (hold) return;
+    const held = heldContentRef.current[pane];
+    if (!held) return;
+    heldContentRef.current[pane] = null;
+    const viewing = pane === 'primary' ? selectedSessionIdRef.current : splitSessionIdRef.current;
+    if (held.sessionId !== viewing) return;
+    (pane === 'primary' ? setContent : setSplitContent)(held.content);
+  };
+
+  const beginTouch = (pane: 'primary' | 'split') => {
+    touchingRef.current[pane] = true;
+    holdRef.current[pane] = true;
+  };
+  const endTouch = (pane: 'primary' | 'split') => {
+    touchingRef.current[pane] = false;
+    reconcileHold(pane);
+  };
+
+  useEffect(() => {
+    const onSelectionChange = () => {
+      reconcileHold('primary');
+      reconcileHold('split');
+      setSelectionHold(hasSelectionIn(contentRef.current) || hasSelectionIn(splitContentRef.current));
+    };
+    document.addEventListener('selectionchange', onSelectionChange);
+    return () => document.removeEventListener('selectionchange', onSelectionChange);
   }, []);
 
   // Keep screen awake
@@ -913,12 +973,12 @@ export default function App() {
   };
 
   return (
-    <div className="flex flex-col bg-[#0a0a0a] font-mono overflow-hidden select-none relative pt-safe pb-safe-root pl-safe pr-safe" style={{ height: '100dvh' }}>
+    <div className="flex flex-col bg-[#0a0a0a] font-mono overflow-hidden relative pt-safe pb-safe-root pl-safe pr-safe" style={{ height: '100dvh' }}>
 
       {/* ── Access Key Overlay ── */}
       {authError && (
         <div
-          className="fixed inset-0 z-[110] flex items-center justify-center px-5"
+          className="fixed inset-0 z-[110] flex items-center justify-center px-5 select-none"
           style={{ backgroundColor: 'rgba(0,0,0,0.94)', backdropFilter: 'blur(10px)', WebkitBackdropFilter: 'blur(10px)' }}
         >
           <form
@@ -960,7 +1020,7 @@ export default function App() {
       {/* ── Reconnect Overlay ── */}
       {!authError && !connected && (
         <div
-          className="fixed inset-0 z-[100] flex flex-col items-center justify-center gap-3"
+          className="fixed inset-0 z-[100] flex flex-col items-center justify-center gap-3 select-none"
           style={{ backgroundColor: 'rgba(0,0,0,0.9)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)' }}
         >
           <WifiOff className="w-8 h-8 text-red-400 animate-pulse" />
@@ -975,7 +1035,7 @@ export default function App() {
 
       {notice && (
         <div
-          className="fixed left-1/2 z-[120] -translate-x-1/2 rounded-full border border-zinc-700 bg-zinc-900/95 px-4 py-2 text-[11px] text-zinc-300 shadow-xl"
+          className="fixed left-1/2 z-[120] -translate-x-1/2 rounded-full border border-zinc-700 bg-zinc-900/95 px-4 py-2 text-[11px] text-zinc-300 shadow-xl select-none"
           style={{ top: 'calc(env(safe-area-inset-top, 0px) + 3.25rem)' }}
         >
           {notice}
@@ -983,7 +1043,7 @@ export default function App() {
       )}
 
       {/* ── Top Bar ── */}
-      <div className={`flex items-center justify-between bg-zinc-900/80 border-b border-zinc-800 z-50 flex-shrink-0 ${isLandscape ? 'px-2 h-8' : 'px-4 h-11'}`}>
+      <div className={`flex items-center justify-between bg-zinc-900/80 border-b border-zinc-800 z-50 flex-shrink-0 select-none ${isLandscape ? 'px-2 h-8' : 'px-4 h-11'}`}>
         <div className="flex items-center gap-2.5">
           <div className="relative">
             <div
@@ -1003,11 +1063,21 @@ export default function App() {
               {latency}ms
             </span>
           )}
+          {selectionHold && (
+            <span
+              className="text-[8px] font-bold tracking-[0.16em] text-amber-400"
+              title="Live updates are paused while terminal text is selected"
+            >
+              PAUSED
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-1.5">
           {/* Alert toggle */}
           <button
             onClick={() => setAlertDone(!alertDone)}
+            aria-label="Alert when output stops"
+            aria-pressed={alertDone}
             className={`flex flex-col items-center gap-0.5 rounded-md border transition-all active:scale-95 ${isLandscape ? 'p-1' : 'p-1.5'}`}
             style={{
               color: alertDone ? '#fbbf24' : '#52525b',
@@ -1021,6 +1091,8 @@ export default function App() {
           {/* Scroll lock */}
           <button
             onClick={() => setScrollLocked(!scrollLocked)}
+            aria-label="Lock scroll position"
+            aria-pressed={scrollLocked}
             className={`flex flex-col items-center gap-0.5 rounded-md border transition-all active:scale-95 ${isLandscape ? 'p-1' : 'p-1.5'}`}
             style={{
               color: scrollLocked ? '#f87171' : '#52525b',
@@ -1037,6 +1109,8 @@ export default function App() {
               if (broadcastMode) { setBroadcastMode(false); setBroadcastTargets(new Set()); }
               else { setBroadcastMode(true); setBroadcastTargets(new Set(state.map(w => w.id))); }
             }}
+            aria-label="Broadcast to windows"
+            aria-pressed={broadcastMode}
             className={`flex flex-col items-center gap-0.5 rounded-md border transition-all active:scale-95 ${isLandscape ? 'p-1' : 'p-1.5'}`}
             style={{
               color: broadcastMode ? BROADCAST_COLOR : '#52525b',
@@ -1072,6 +1146,8 @@ export default function App() {
                 socketRef.current?.emit('getContent', { sessionId: sid });
               }
             }}
+            aria-label="Show a second pane"
+            aria-pressed={splitMode}
             className={`flex flex-col items-center gap-0.5 rounded-md border transition-all active:scale-95 ${isLandscape ? 'p-1' : 'p-1.5'}`}
             style={{
               color: splitMode ? '#38bdf8' : '#52525b',
@@ -1085,6 +1161,7 @@ export default function App() {
           </button>
           <button
             onClick={() => state.length > 1 && screenSize && setShowMap(!showMap)}
+            aria-label="Choose window"
             className="text-[10px] font-bold tracking-wide px-2.5 py-1 rounded-md border transition-all active:scale-95"
             style={{
               color: showMap ? '#000' : '#71717a',
@@ -1101,7 +1178,7 @@ export default function App() {
       {/* ── Window Map (fullscreen overlay) ── */}
       {showMap && state.length > 1 && screenSize && (
         <div
-          className="fixed inset-0 z-50 flex flex-col items-center justify-center"
+          className="fixed inset-0 z-50 flex flex-col items-center justify-center select-none"
           onClick={() => setShowMap(false)}
           style={{ backgroundColor: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)' }}
         >
@@ -1151,7 +1228,7 @@ export default function App() {
       {/* ── Split Window Map (fullscreen overlay) ── */}
       {showSplitMap && state.length > 1 && screenSize && (
         <div
-          className="fixed inset-0 z-50 flex flex-col items-center justify-center"
+          className="fixed inset-0 z-50 flex flex-col items-center justify-center select-none"
           onClick={() => setShowSplitMap(false)}
           style={{ backgroundColor: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)' }}
         >
@@ -1201,7 +1278,7 @@ export default function App() {
       {/* ── Pane Layout Map (spatial pane switcher) ── */}
       {showPaneMap && primaryPanes.length > 1 && (
         <div
-          className="fixed inset-0 z-[60] flex flex-col items-center justify-center"
+          className="fixed inset-0 z-[60] flex flex-col items-center justify-center select-none"
           onClick={() => setShowPaneMap(false)}
           style={{ backgroundColor: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)' }}
         >
@@ -1269,7 +1346,7 @@ export default function App() {
       )}
 
       {/* ── Tab Bar ── */}
-      <div className="flex items-center bg-[#0f0f0f] border-b border-zinc-800/60 flex-shrink-0 overflow-x-auto no-scrollbar">
+      <div className="flex items-center bg-[#0f0f0f] border-b border-zinc-800/60 flex-shrink-0 overflow-x-auto no-scrollbar select-none">
         <button
           onClick={() => setTabListTarget(tabListTarget === 'tabBar' ? null : 'tabBar')}
           className={`sticky left-0 z-10 flex flex-shrink-0 items-center justify-center border-r border-zinc-700/50 bg-[#0f0f0f] text-zinc-500 active:text-zinc-200 ${isLandscape ? 'w-9 min-h-[32px]' : 'w-11 min-h-[44px]'}`}
@@ -1351,7 +1428,7 @@ export default function App() {
       {/* ── Broadcast indicator ── */}
       {broadcastMode && (
         <div
-          className="flex items-center gap-2 px-4 py-1.5 flex-shrink-0"
+          className="flex items-center gap-2 px-4 py-1.5 flex-shrink-0 select-none"
           style={{ backgroundColor: BROADCAST_COLOR + '10', borderBottom: `1px solid ${BROADCAST_COLOR}30` }}
         >
           <Radio className="w-3 h-3 text-indigo-400" />
@@ -1399,6 +1476,9 @@ export default function App() {
               primaryAtBottomRef.current = isScrolledToBottom(event.currentTarget);
               loadEarlierContent('primary', selectedSessionId, content, event.currentTarget);
             }}
+            onTouchStart={() => beginTouch('primary')}
+            onTouchEnd={() => endTouch('primary')}
+            onTouchCancel={() => endTouch('primary')}
             className="flex-1 overflow-auto relative min-h-0 min-w-0"
           >
             {content && content.lines.length ? (
@@ -1411,9 +1491,7 @@ export default function App() {
                           <span key={j} className="cursor-blink cursor-cell" style={{ color: ACCENT }} aria-hidden="true">█</span>
                         )
                       ) : (
-                        <span key={j} style={{ color: r.f, fontWeight: r.b ? 600 : 400, opacity: r.d ? 0.55 : 1, ...(r.g ? { backgroundColor: r.g } : null) }}>
-                          {r.t}
-                        </span>
+                        <TerminalRun key={j} run={r} />
                       )
                     ))}
                     {i < content.lines.length - 1 ? '\n' : ''}
@@ -1432,7 +1510,7 @@ export default function App() {
         {/* Drag divider */}
         {splitMode && (
           <div
-            className={`flex-shrink-0 flex items-center justify-center touch-none ${isLandscape ? 'w-3 cursor-col-resize' : 'h-3 cursor-row-resize'}`}
+            className={`flex-shrink-0 flex items-center justify-center touch-none select-none ${isLandscape ? 'w-3 cursor-col-resize' : 'h-3 cursor-row-resize'}`}
             style={{ backgroundColor: '#18181b' }}
             onTouchMove={handleSplitDrag}
           >
@@ -1449,7 +1527,7 @@ export default function App() {
             onClick={() => setFocusedPane('split')}
           >
             {/* Split pane tab bar */}
-            <div className="flex items-center bg-[#0f0f0f] border-b border-zinc-800/60 flex-shrink-0 overflow-x-auto no-scrollbar">
+            <div className="flex items-center bg-[#0f0f0f] border-b border-zinc-800/60 flex-shrink-0 overflow-x-auto no-scrollbar select-none">
               <button
                 onClick={(event) => {
                   event.stopPropagation();
@@ -1540,6 +1618,9 @@ export default function App() {
                 splitAtBottomRef.current = isScrolledToBottom(event.currentTarget);
                 loadEarlierContent('split', splitSessionId, splitContent, event.currentTarget);
               }}
+              onTouchStart={() => beginTouch('split')}
+              onTouchEnd={() => endTouch('split')}
+              onTouchCancel={() => endTouch('split')}
               className="flex-1 overflow-auto relative min-h-0 min-w-0"
               style={{ borderLeft: `3px solid ${focusedPane === 'split' ? '#38bdf8' : '#38bdf830'}` }}
             >
@@ -1553,9 +1634,7 @@ export default function App() {
                             <span key={j} className="cursor-blink cursor-cell" style={{ color: '#38bdf8' }} aria-hidden="true">█</span>
                           )
                         ) : (
-                          <span key={j} style={{ color: r.f, fontWeight: r.b ? 600 : 400, opacity: r.d ? 0.55 : 1, ...(r.g ? { backgroundColor: r.g } : null) }}>
-                            {r.t}
-                          </span>
+                          <TerminalRun key={j} run={r} />
                         )
                       ))}
                       {i < splitContent.lines.length - 1 ? '\n' : ''}
@@ -1603,7 +1682,7 @@ export default function App() {
       )}
 
       {/* ── Quick Actions ── */}
-      <div className={`flex items-center gap-1.5 bg-zinc-950/60 border-t border-zinc-800/40 flex-shrink-0 overflow-x-auto no-scrollbar ${isLandscape ? 'px-2 py-1' : 'px-3 py-2'}`}>
+      <div className={`flex items-center gap-1.5 bg-zinc-950/60 border-t border-zinc-800/40 flex-shrink-0 overflow-x-auto no-scrollbar select-none ${isLandscape ? 'px-2 py-1' : 'px-3 py-2'}`}>
         <QuickBtn label="ESC" onClick={() => sendSpecialKey('\x1b')} color="#f87171" />
         <QuickBtn label="^C" onClick={() => sendSpecialKey('\x03')} color="#f87171" />
         <QuickBtn label="^D" onClick={() => sendSpecialKey('\x04')} color="#fbbf24" />
@@ -1723,6 +1802,8 @@ export default function App() {
           .pl-safe { padding-left: max(0px, env(safe-area-inset-left)); }
           .pr-safe { padding-right: max(0px, env(safe-area-inset-right)); }
         }
+        .terminal-link { text-decoration: underline; text-decoration-color: currentColor; text-underline-offset: 2px; cursor: pointer; }
+        .terminal-link:active { opacity: 0.6; }
         .cursor-blink { animation: blink 1s step-end infinite; }
         .cursor-cell { display: inline-block; position: relative; width: 0; z-index: 1; }
         @keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
@@ -1744,7 +1825,7 @@ function TabListOverlay({ tabs, selectedId, accent, onSelect, onClose }: {
 }) {
   return (
     <div
-      className="fixed inset-0 z-[70] flex items-start justify-center px-4 pt-[max(5rem,env(safe-area-inset-top))]"
+      className="fixed inset-0 z-[70] flex items-start justify-center px-4 pt-[max(5rem,env(safe-area-inset-top))] select-none"
       onClick={onClose}
       style={{ backgroundColor: 'rgba(0,0,0,0.82)', backdropFilter: 'blur(10px)', WebkitBackdropFilter: 'blur(10px)' }}
     >
@@ -1832,7 +1913,7 @@ function TypingLogOverlay({ log, onClose }: { log: string; onClose: () => void }
         className="flex w-full max-w-lg flex-col overflow-hidden rounded-xl border border-zinc-700/60 bg-[#111113] shadow-2xl"
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3 flex-shrink-0">
+        <div className="flex items-center justify-between border-b border-zinc-800 px-4 py-3 flex-shrink-0 select-none">
           <span className="text-[10px] font-bold tracking-[0.2em] text-zinc-500">
             RECENT TYPING
           </span>
@@ -1869,6 +1950,31 @@ function TypingLogOverlay({ log, onClose }: { log: string; onClose: () => void }
         </div>
       </div>
     </div>
+  );
+}
+
+// --- One styled run of terminal text ---
+// A run carrying a link — an OSC 8 hyperlink, or a web address the server
+// recognised — is an anchor that opens in a new tab, with loopback hosts
+// pointed back at the Mac so a dev server's printed URL works from the phone.
+function TerminalRun({ run }: { run: Run }) {
+  const style: React.CSSProperties = {
+    color: run.f,
+    fontWeight: run.b ? 600 : 400,
+    opacity: run.d ? 0.55 : 1,
+    ...(run.g ? { backgroundColor: run.g } : null),
+  };
+  if (!run.u) return <span style={style}>{run.t}</span>;
+  return (
+    <a
+      href={linkHref(run.u, window.location.hostname)}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="terminal-link"
+      style={style}
+    >
+      {run.t}
+    </a>
   );
 }
 
@@ -1909,7 +2015,7 @@ function PaneSwitcher({ panes, selectedId, onSelect, onOpenMap }: {
   onOpenMap: () => void;
 }) {
   return (
-    <div className="flex items-center gap-1 px-2 py-1 bg-[#0c0c0c] border-b border-zinc-800/60 overflow-x-auto no-scrollbar flex-shrink-0">
+    <div className="flex items-center gap-1 px-2 py-1 bg-[#0c0c0c] border-b border-zinc-800/60 overflow-x-auto no-scrollbar flex-shrink-0 select-none">
       <button
         onClick={(e) => { e.stopPropagation(); onOpenMap(); }}
         className="flex items-center gap-1 text-[8px] font-bold tracking-[0.15em] text-zinc-500 hover:text-zinc-300 active:text-zinc-200 pr-1 flex-shrink-0 transition-colors"
