@@ -92,10 +92,16 @@ function showPane(lines: Run[][]) {
 
 beforeEach(() => {
   localStorage.clear();
+  sessionStorage.clear();
   fakes.sockets.length = 0;
   window.matchMedia = portrait;
+  // A connect renews the auth cookie over the network; keep that off the wire.
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 204 })));
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.unstubAllGlobals();
+});
 
 describe('the unsent command', () => {
   it('is back in the box after the page reloads', async () => {
@@ -215,5 +221,46 @@ describe('live updates while terminal text is selected', () => {
     act(() => { document.dispatchEvent(new Event('selectionchange')); });
 
     expect(document.body.textContent).not.toContain('late frame for s1');
+  });
+});
+
+
+describe('connection diagnostics', () => {
+  const hello = () => latestSocket().emitted.filter((e) => e.event === 'hello').map((e) => e.payload);
+
+  const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null;
+
+  it('introduces each connection to the server with the page identity', () => {
+    render(<App />);
+    act(() => latestSocket().receive('connect', undefined));
+    expect(hello()).toEqual([expect.objectContaining({
+      page: expect.any(String), connect: expect.any(Number), navigation: expect.any(String), visibility: 'visible', lastDisconnect: null,
+    })]);
+  });
+
+  it('reports how the previous connection ended when the same page reconnects', () => {
+    render(<App />);
+    act(() => latestSocket().receive('connect', undefined));
+    act(() => latestSocket().receive('disconnect', 'transport close'));
+    act(() => latestSocket().receive('connect', undefined));
+    const [first, second] = hello();
+    if (!isRecord(first) || !isRecord(second)) throw new Error('expected two hello payloads');
+    // Same page, next connection: the counter moves on and the page id does not.
+    expect(second.page).toBe(first.page);
+    expect(second.connect).toBe(Number(first.connect) + 1);
+    expect(second.lastDisconnect).toEqual(expect.objectContaining({ reason: 'transport close', visibility: 'visible' }));
+  });
+
+  it('carries the last disconnect across a reload of the same tab', () => {
+    render(<App />);
+    act(() => latestSocket().receive('connect', undefined));
+    act(() => latestSocket().receive('disconnect', 'ping timeout'));
+
+    reloadPage();
+    act(() => latestSocket().receive('connect', undefined));
+
+    expect(hello()).toEqual([expect.objectContaining({
+      lastDisconnect: expect.objectContaining({ reason: 'ping timeout' }),
+    })]);
   });
 });

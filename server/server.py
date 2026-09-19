@@ -950,7 +950,14 @@ async def connect(sid, environ, auth=None):
     clients.add(sid)
     start_client_delivery(sid)
     agent = str(environ.get("HTTP_USER_AGENT", "?"))[:90]
-    log(f"Client connected: {sid} by {'key' if by_key else 'cookie'} ({agent})")
+    # The peer address tells the LAN path (192.168.x) from the tailnet one
+    # (100.x) when a phone keeps dropping — the two fail differently. Read
+    # from the aiohttp request: python-engineio's aiohttp driver fills
+    # REMOTE_ADDR with a constant 127.0.0.1.
+    request = environ.get("aiohttp.request")
+    peer = getattr(request, "remote", None) or "?"
+    log(f"Client connected: {sid} by {'key' if by_key else 'cookie'} "
+        f"from {peer} ({agent})")
     # Seeding is deferred to a task because python-socketio only acknowledges
     # the connection once this handler returns, and seeding needs a dozen
     # iTerm2 RPCs. Inline, that made the Socket.IO handshake as slow as
@@ -961,15 +968,30 @@ async def connect(sid, environ, auth=None):
     seed_tasks[sid] = asyncio.create_task(seed_client(sid))
 
 
+def _client_transport(sid: str) -> str:
+    """'websocket' or 'polling' for a live Socket.IO client, else '?'."""
+    eio_sid = sio.manager.eio_sid_from_sid(sid, "/")
+    socket = sio.eio.sockets.get(eio_sid) if eio_sid else None
+    if socket is None:
+        return "?"
+    return "websocket" if getattr(socket, "upgraded", False) else "polling"
+
+
 @sio.event
 async def disconnect(sid, reason=None):
+    # Read before teardown: Engine.IO drops its socket once this returns.
+    transport = _client_transport(sid)
     clients.discard(sid)
     watched_by_sid.pop(sid, None)
     seed = seed_tasks.pop(sid, None)
     if seed is not None:
         seed.cancel()
     await stop_client_delivery(sid)
-    log(f"Client disconnected: {sid}")
+    # The reason is the whole diagnosis when a phone keeps reconnecting:
+    # 'ping timeout' is a stalled path, 'transport close' is the network or
+    # the OS closing the socket under us, 'client disconnect' is the page
+    # itself letting go.
+    log(f"Client disconnected: {sid} ({reason or 'no reason'}, {transport})")
     if not clients:
         await stop_all_streams()
     else:
@@ -1006,6 +1028,17 @@ async def on_watch(sid, data):
                 {"sessionId": session_id, **content})
 
     await apply_watches()
+
+
+@sio.on("hello")
+async def on_hello(sid, data):
+    # Client-reported context for a connection, logged for diagnosing
+    # reconnect churn: whether this is a fresh page load or the same page
+    # reconnecting, how the page saw its previous connection end, and what
+    # it could see of the network at the time. Data only; never acted on.
+    if not isinstance(data, dict):
+        return
+    log(f"hello {sid}: {json.dumps(data, sort_keys=True)[:500]}")
 
 
 @sio.event

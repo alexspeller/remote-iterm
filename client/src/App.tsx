@@ -35,6 +35,7 @@ const ACCESS_KEY_STORAGE_KEY = 'remote-iterm-access-key';
 const SMART_TYPING_KEY = 'remote-iterm-smart-typing';
 const TYPING_LOG_KEY = 'remote-iterm-typing-log';
 const COMMAND_DRAFT_KEY = 'remote-iterm-command-draft';
+const LAST_DISCONNECT_KEY = 'remote-iterm-last-disconnect';
 const MAX_HISTORY = 100;
 const MAX_TYPING_LOG_CHARS = 20000;
 const BOTTOM_THRESHOLD_PX = 4;
@@ -105,6 +106,65 @@ function loadTypingLog(): string {
 // keystroke, and is put back in the box on the next load.
 function loadCommandDraft(): string {
   try { return localStorage.getItem(COMMAND_DRAFT_KEY) || ''; } catch { return ''; }
+}
+
+// --- Connection diagnostics ---
+// Each connection introduces itself to the server (`hello`) with what only
+// the page can know: whether this is a fresh load or the same page
+// reconnecting, how the page saw its previous connection end, and what it
+// could see of the network. The server only logs it; it exists so that a
+// phone that keeps showing RECONNECTING can be diagnosed from the Mac.
+const PAGE_ID = Math.random().toString(36).slice(2, 8);
+let connectCount = 0;
+
+interface LastDisconnect { reason: string; at: number; visibility: string }
+
+function isLastDisconnect(value: unknown): value is LastDisconnect {
+  return typeof value === 'object' && value !== null
+    && 'reason' in value && typeof value.reason === 'string'
+    && 'at' in value && typeof value.at === 'number'
+    && 'visibility' in value && typeof value.visibility === 'string';
+}
+
+// sessionStorage: survives a reload of this tab, not a new tab, which is
+// exactly the distinction wanted.
+function rememberDisconnect(reason: string) {
+  try {
+    sessionStorage.setItem(LAST_DISCONNECT_KEY, JSON.stringify({ reason, at: Date.now(), visibility: document.visibilityState }));
+  } catch {}
+}
+
+function takeLastDisconnect(): LastDisconnect | null {
+  try {
+    const raw = sessionStorage.getItem(LAST_DISCONNECT_KEY);
+    sessionStorage.removeItem(LAST_DISCONNECT_KEY);
+    if (!raw) return null;
+    const parsed: unknown = JSON.parse(raw);
+    return isLastDisconnect(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function navigationType(): string {
+  const entry = performance.getEntriesByType('navigation')[0];
+  return typeof PerformanceNavigationTiming !== 'undefined' && entry instanceof PerformanceNavigationTiming
+    ? entry.type
+    : 'unknown';
+}
+
+function connectionHello() {
+  const last = takeLastDisconnect();
+  connectCount += 1;
+  return {
+    page: PAGE_ID,
+    connect: connectCount,
+    navigation: navigationType(),
+    visibility: document.visibilityState,
+    online: navigator.onLine,
+    host: window.location.host,
+    lastDisconnect: last ? { ...last, agoMs: Date.now() - last.at } : null,
+  };
 }
 
 // A single rolling string rather than an array of entries: a buffered
@@ -312,9 +372,13 @@ export default function App() {
     s.on('connect', () => {
       setAuthError(false);
       setConnected(true);
+      s.emit('hello', connectionHello());
       void refreshKeyCookie(accessKey);
     });
-    s.on('disconnect', () => setConnected(false));
+    s.on('disconnect', (reason) => {
+      setConnected(false);
+      rememberDisconnect(reason);
+    });
     s.on('connect_error', (error) => {
       setConnected(false);
       if (error.message === 'invalid access key') {
