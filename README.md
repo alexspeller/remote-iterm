@@ -74,7 +74,8 @@ For the component model, data flow, Socket.IO contract, and design trade-offs, s
 
 - Live terminal output with profile-aware ANSI and true-color rendering
 - Bounded live delivery that remains safe when a phone sleeps or its connection stalls
-- Machine-stable shared-key authentication through QR and bookmarked URLs
+- Machine-stable shared-key authentication through QR and bookmarked URLs, kept alive by an HttpOnly cookie so a phone that only ever arrives via notification links keeps working
+- Notification deep links: `#session=<iTerm session id>` opens that pane and focuses it on the Mac
 - Visible cursor, bold, faint, inverse, and background styles
 - Tab creation, closing, selection, and long-press rename
 - Horizontal tab strips with a touch-friendly vertical tab picker
@@ -145,6 +146,12 @@ npm install
 
 The first launch creates `server/.venv`, installs the Python dependencies, and generates a private shared access key. The QR code and printed URLs include that key in the URL fragment, so the page can be bookmarked without sending the key in the initial HTTP request. Later launches reuse the same key and reinstall dependencies only when `server/requirements.txt` changes.
 
+Once a browser has connected with the key, the server also hands it an HttpOnly cookie (`POST /auth`) that authenticates on its own and is renewed on every connection. Safari deletes a site's `localStorage` after seven days of Safari use without a visit, which is exactly what happens to a phone that only opens remote-iterm from notification taps; the cookie survives that. Each browser context (Safari, a home-screen web app, an in-app browser) has its own storage, so each needs the key once.
+
+### Notification deep links
+
+Open `http://<mac>:7292/#session=<iTerm session id>` and the client jumps to that pane (in whichever window and tab it lives) and focuses it on the Mac; the id is the UUID after the colon in `ITERM_SESSION_ID`. A push notification whose tap action is that URL therefore lands on the pane that sent it. The link carries no key; the page relies on the stored one, so open the QR URL once in the browser the notifications will use. A pane that has since closed falls back to the front window with a brief notice.
+
 ## Development and tests
 
 This repository uses `mise` when a tool configuration is available:
@@ -152,6 +159,7 @@ This repository uses `mise` when a tool configuration is available:
 ```bash
 mise exec -- npm install
 mise exec -- npm --prefix client run build
+mise exec -- npm --prefix client test
 
 # After ./iterm-server has created server/.venv
 mise exec -- server/.venv/bin/python -m unittest \

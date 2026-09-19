@@ -2,7 +2,11 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
+from aiohttp.test_utils import TestClient, TestServer
+import socketio
+
 import server.server as server_module
+from server.auth import COOKIE_MAX_AGE, COOKIE_NAME
 from server.server import (
     _DEFAULT_PALETTE,
     _content_line_range,
@@ -519,6 +523,130 @@ class InitialWatchSnapshotTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)  # let apply_watches' no-op stream task settle
 
         self.assertNotIn("content:session-2", pending_events["late"])
+
+
+class CookieCredentialConnectTest(unittest.IsolatedAsyncioTestCase):
+    """A phone whose localStorage Safari has purged still carries the HttpOnly
+    cookie from /auth; the Socket.IO handshake must accept it in place of the
+    auth-payload key."""
+
+    async def asyncSetUp(self):
+        for entry in (
+            patch.object(server_module, "shared_key", "the-key"),
+            patch.object(server_module, "start_client_delivery", lambda sid: None),
+            patch.object(server_module, "seed_client", AsyncMock()),
+        ):
+            entry.start()
+            self.addCleanup(entry.stop)
+
+    async def asyncTearDown(self):
+        for task in list(server_module.seed_tasks.values()):
+            await task
+        server_module.seed_tasks.clear()
+        server_module.clients.clear()
+
+    async def test_cookie_alone_authenticates(self):
+        await server_module.connect(
+            "cookie-client", {"HTTP_COOKIE": f"other=1; {COOKIE_NAME}=the-key"}, None)
+        self.assertIn("cookie-client", server_module.clients)
+
+    async def test_auth_payload_key_still_authenticates(self):
+        await server_module.connect("key-client", {}, {"key": "the-key"})
+        self.assertIn("key-client", server_module.clients)
+
+    async def test_wrong_cookie_and_no_key_is_refused(self):
+        with self.assertRaises(socketio.exceptions.ConnectionRefusedError):
+            await server_module.connect(
+                "stranger", {"HTTP_COOKIE": f"{COOKIE_NAME}=wrong"}, None)
+        self.assertNotIn("stranger", server_module.clients)
+
+    async def test_wrong_key_is_not_rescued_by_a_wrong_cookie(self):
+        with self.assertRaises(socketio.exceptions.ConnectionRefusedError):
+            await server_module.connect(
+                "stranger", {"HTTP_COOKIE": f"{COOKIE_NAME}=wrong"}, {"key": "wrong"})
+
+
+class AuthCookieRouteTest(unittest.IsolatedAsyncioTestCase):
+    """POST /auth turns a valid key (or a valid existing cookie) into a fresh
+    long-lived HttpOnly cookie, and only for pages served by this machine."""
+
+    async def asyncSetUp(self):
+        entry = patch.object(server_module, "shared_key", "the-key")
+        entry.start()
+        self.addCleanup(entry.stop)
+        self.client = TestClient(TestServer(server_module.create_app()))
+        await self.client.start_server()
+        # The test server listens on 127.0.0.1, so a page on another port of
+        # that host is "local"; anything else is a foreign site.
+        self.local_origin = "http://127.0.0.1:7292"
+
+    async def asyncTearDown(self):
+        await self.client.close()
+
+    async def test_valid_key_from_a_local_page_is_issued_the_cookie(self):
+        resp = await self.client.post(
+            "/auth", json={"key": "the-key"}, headers={"Origin": self.local_origin})
+
+        self.assertEqual(resp.status, 204)
+        self.assertEqual(resp.headers["Access-Control-Allow-Origin"], self.local_origin)
+        self.assertEqual(resp.headers["Access-Control-Allow-Credentials"], "true")
+        cookie = resp.cookies[COOKIE_NAME]
+        self.assertEqual(cookie.value, "the-key")
+        self.assertTrue(cookie["httponly"])
+        self.assertEqual(cookie["samesite"], "Lax")
+        self.assertEqual(cookie["max-age"], str(COOKIE_MAX_AGE))
+        self.assertEqual(cookie["path"], "/")
+
+    async def test_an_existing_valid_cookie_is_renewed_without_a_key(self):
+        resp = await self.client.post(
+            "/auth", headers={"Origin": self.local_origin,
+                              "Cookie": f"{COOKIE_NAME}=the-key"})
+
+        self.assertEqual(resp.status, 204)
+        self.assertEqual(resp.cookies[COOKIE_NAME].value, "the-key")
+
+    async def test_wrong_key_gets_no_cookie(self):
+        resp = await self.client.post(
+            "/auth", json={"key": "wrong"}, headers={"Origin": self.local_origin})
+
+        self.assertEqual(resp.status, 401)
+        self.assertNotIn(COOKIE_NAME, resp.cookies)
+
+    async def test_foreign_origin_is_refused_even_with_the_right_key(self):
+        resp = await self.client.post(
+            "/auth", json={"key": "the-key"}, headers={"Origin": "http://evil.example"})
+
+        self.assertEqual(resp.status, 403)
+        self.assertNotIn(COOKIE_NAME, resp.cookies)
+        self.assertNotIn("Access-Control-Allow-Origin", resp.headers)
+
+    async def test_preflight_allows_only_local_pages(self):
+        allowed = await self.client.options(
+            "/auth", headers={"Origin": self.local_origin,
+                              "Access-Control-Request-Method": "POST"})
+        self.assertEqual(allowed.status, 204)
+        self.assertEqual(allowed.headers["Access-Control-Allow-Origin"], self.local_origin)
+        self.assertEqual(allowed.headers["Access-Control-Allow-Credentials"], "true")
+        self.assertIn("POST", allowed.headers["Access-Control-Allow-Methods"])
+        self.assertIn("Content-Type", allowed.headers["Access-Control-Allow-Headers"])
+
+        refused = await self.client.options(
+            "/auth", headers={"Origin": "http://evil.example",
+                              "Access-Control-Request-Method": "POST"})
+        self.assertEqual(refused.status, 403)
+
+    async def test_socket_io_handshake_refuses_a_foreign_origin(self):
+        resp = await self.client.get(
+            "/socket.io/?EIO=4&transport=polling",
+            headers={"Origin": "http://evil.example"})
+        self.assertEqual(resp.status, 400)
+
+        local = await self.client.get(
+            "/socket.io/?EIO=4&transport=polling",
+            headers={"Origin": self.local_origin})
+        self.assertEqual(local.status, 200)
+        self.assertEqual(local.headers["Access-Control-Allow-Origin"], self.local_origin)
+        self.assertEqual(local.headers["Access-Control-Allow-Credentials"], "true")
 
 
 if __name__ == "__main__":

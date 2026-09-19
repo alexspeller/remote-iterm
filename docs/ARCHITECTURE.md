@@ -70,7 +70,8 @@ The Vite/React client maintains the selected window, tab, and session separately
 - Provides a direct-input mode that keeps the native mobile keyboard open and forwards text and terminal keys immediately, while retaining the separate buffered command field.
 - Stores command history only in browser `localStorage`.
 - Reconnects indefinitely and measures Socket.IO round-trip latency.
-- Reads the shared key from the URL fragment, remembers it in browser `localStorage`, and sends it in the Socket.IO authentication payload.
+- Reads the shared key from the URL fragment, remembers it in browser `localStorage`, and sends it in the Socket.IO authentication payload — or connects on the server's HttpOnly cookie alone when it has no key, showing the key prompt only after a refusal. Every successful connection posts to `/auth` to renew that cookie.
+- Resolves a notification deep link (`#session=<id>`, see `client/src/deepLink.ts`) against the first complete state: selects the pane's window, tab, and pane, asks the Mac to focus it, and strips the parameter from the URL so a reload does not jump back.
 
 The client is an installable PWA, but it is still a web application served by the Mac. There is no cloud relay or hosted control plane.
 
@@ -107,7 +108,7 @@ The protocol intentionally evolves the upstream event names where possible so th
 | client → server | `broadcast` | Execute a command in a list of sessions |
 | client → server | `newTab`, `closeTab` | Change the active iTerm window's tabs |
 | client → server | `renameSession` | Rename one iTerm session |
-| client → server | `focus` | Activate an iTerm window and tab on the Mac |
+| client → server | `focus` | Activate an iTerm window and tab on the Mac, or a specific pane when `sessionId` is given |
 | bidirectional ack | `ping` | Measure application-level round-trip latency |
 
 Styled terminal content is run-length encoded. Each run uses `t` for text and may include `f` (foreground), `g` (background), `b` (bold), `d` (faint), or `c` (cursor). Omitted colors inherit the pane's default `fg` and `bg` values.
@@ -146,7 +147,9 @@ The service writes directly to the target iTerm2 session:
 
 ## Trust and security model
 
-The backend listens on all interfaces and allows any Socket.IO origin, but rejects the Socket.IO namespace connection unless its authentication payload contains the generated shared key. Rejection happens before window state or terminal content is emitted. The key is stored in a user-only file on the Mac and in browser `localStorage`; QR and bookmark URLs carry it in the fragment, which browsers do not include in the initial HTTP request.
+The backend listens on all interfaces but rejects the Socket.IO namespace connection unless the generated shared key arrives either in the authentication payload or in the `remote_iterm_key` cookie. Rejection happens before window state or terminal content is emitted. The key is stored in a user-only file on the Mac and in browser `localStorage`; QR and bookmark URLs carry it in the fragment, which browsers do not include in the initial HTTP request.
+
+The cookie exists because Safari deletes a site's script-writable storage after seven days of Safari use without interaction with the site, and a phone that only opens remote-iterm from notification deep links fits that pattern exactly; server-set cookies are not subject to that purge. `POST /auth` issues it (HttpOnly, `SameSite=Lax`, one year) to a request carrying a valid key or a valid existing cookie, so its lifetime slides with use. Cookies are scoped by host rather than port, so the cookie set by the API on 7291 rides along from the page served on 7292. Because the cookie is sent automatically, cross-origin requests are only accepted from origins whose host matches the request's `Host` header, whatever the port (`is_trusted_origin`); Engine.IO rejects other origins outright and `/auth` refuses them. `SameSite=Lax` additionally stops other sites from carrying the cookie at all.
 
 This is bearer-key authentication, not encrypted transport. The subsequent Socket.IO authentication payload and terminal traffic travel over plain HTTP/WebSocket, so a capable network observer can capture them and reuse the key. There is also no per-client authorization, command confirmation, or read-only mode. Do not expose ports 7291 or 7292 to the public internet; prefer a trusted LAN or VPN and treat TLS as a prerequisite before any remote relay or internet-facing deployment.
 

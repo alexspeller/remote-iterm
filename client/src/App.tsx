@@ -2,13 +2,10 @@ import { useState, useEffect, useLayoutEffect, useRef, useMemo, memo } from 'rea
 import { io, Socket } from 'socket.io-client';
 import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, Rows2, LayoutGrid, List as ListIcon, KeyRound, ScrollText, SpellCheck2 } from 'lucide-react';
 
+import type { Session, Tab, WindowState, ScreenSize } from './types';
+import { deepLinkSessionId, findSessionLocation, stripDeepLink } from './deepLink';
+
 // --- Types ---
-interface PaneRect { x: number; y: number; w: number; h: number; }
-interface Session { id: string; name: string; rect?: PaneRect; }
-interface Tab { index: number; id: string; title?: string; isSelected: boolean; currentSessionId?: string; aspect?: number; maximized?: boolean; sessions: Session[]; }
-interface Bounds { x: number; y: number; w: number; h: number; }
-interface WindowState { id: string; isFront: boolean; tabs: Tab[]; bounds?: Bounds; }
-interface ScreenSize { width: number; height: number; }
 
 // A run of text sharing one style: t=text, f=fg hex, g=bg hex, b=bold, d=dim.
 // f/g omitted means "use the pane default" (theme fg/bg).
@@ -67,6 +64,23 @@ function rememberAccessKey(key: string) {
   try { localStorage.setItem(ACCESS_KEY_STORAGE_KEY, key); } catch {}
   const hash = new URLSearchParams({ key }).toString();
   window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}#${hash}`);
+}
+
+// Ask the server to (re)issue its HttpOnly auth cookie (POST /auth). The key
+// proves who we are the first time; after that the cookie itself does, so this
+// also renews a cookie-only session and its expiry slides forward with use.
+// That cookie is what keeps a notification deep link working after Safari has
+// purged this page's localStorage. Best-effort: the live connection is already
+// up when this runs and does not depend on it.
+async function refreshKeyCookie(key: string) {
+  try {
+    await fetch(`${SOCKET_URL}/auth`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(key ? { key } : {}),
+    });
+  } catch {}
 }
 
 // Off by default, matching prior behavior — this only ever loosens the
@@ -160,6 +174,7 @@ export default function App() {
   const [accessKey, setAccessKey] = useState(loadAccessKey);
   const [accessKeyInput, setAccessKeyInput] = useState('');
   const [authError, setAuthError] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
   const [state, setState] = useState<WindowState[]>([]);
   const [screenSize, setScreenSize] = useState<ScreenSize | null>(null);
   const [content, setContent] = useState<StyledContent | null>(null);
@@ -220,6 +235,9 @@ export default function App() {
   const splitWinIdRef = useRef(splitWinId);
   const splitTabIdRef = useRef(splitTabId);
   const paneMapOpenRef = useRef(false);
+  // The pane a notification deep link asks for, until the first state tells us
+  // where it is (or that it is gone). Survives a key prompt in between.
+  const pendingDeepLinkRef = useRef<string | null>(deepLinkSessionId(window.location.hash));
 
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => { winIdRef.current = selectedWinId; }, [selectedWinId]);
@@ -234,16 +252,22 @@ export default function App() {
     try { localStorage.setItem(TYPING_LOG_KEY, typingLog); } catch {}
   }, [typingLog]);
 
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(null), 4000);
+    return () => clearTimeout(timer);
+  }, [notice]);
+
   // --- Socket init ---
   useEffect(() => {
     setConnected(false);
-    if (!accessKey) {
-      socketRef.current = null;
-      return;
-    }
 
+    // Connect even without a key: the server also accepts its HttpOnly auth
+    // cookie (sent automatically with credentials), so a phone whose
+    // localStorage was purged still gets in. Only a refusal shows the prompt.
     const s = io(SOCKET_URL, {
-      auth: { key: accessKey },
+      auth: accessKey ? { key: accessKey } : {},
+      withCredentials: true,
       reconnection: true,
       reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
@@ -255,6 +279,7 @@ export default function App() {
     s.on('connect', () => {
       setAuthError(false);
       setConnected(true);
+      void refreshKeyCookie(accessKey);
     });
     s.on('disconnect', () => setConnected(false));
     s.on('connect_error', (error) => {
@@ -283,6 +308,10 @@ export default function App() {
       if (newState.length === 0) return;
 
       const frontWin = newState.find(w => w.isFront);
+
+      // A notification deep link names a pane. Every state is a complete
+      // snapshot, so the pane is either in this one or already closed.
+      if (applyPendingDeepLink(newState)) return;
 
       // First load — pick front window
       if (!winIdRef.current) {
@@ -373,6 +402,51 @@ export default function App() {
 
     return () => { s.disconnect(); };
   }, [accessKey]);
+
+  // Apply the pane a deep link asked for, against a complete state snapshot.
+  // Returns true when the selection was taken over (the caller then skips its
+  // own front-window logic). Only touches refs and state setters, so the copy
+  // captured by a long-lived socket handler stays correct.
+  const applyPendingDeepLink = (snapshot: WindowState[]): boolean => {
+    const wanted = pendingDeepLinkRef.current;
+    if (!wanted || snapshot.length === 0) return false;
+    pendingDeepLinkRef.current = null;
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}${stripDeepLink(window.location.hash)}`);
+    const target = findSessionLocation(snapshot, wanted);
+    if (!target) {
+      setNotice('That pane is gone; showing the front window instead.');
+      return false;
+    }
+    setSelectedWinId(target.windowId);
+    setSelectedTabId(target.tabId);
+    setSelectedSessionId(target.sessionId);
+    // Treat its window as the one already being followed, so the front-window
+    // sync in the state handler doesn't reset the pane to the tab's default
+    // once the focus requested here lands on the Mac.
+    prevFrontRef.current = target.windowId;
+    socketRef.current?.emit('focus', { windowId: target.windowId, tabIndex: target.tabIndex, sessionId: target.sessionId });
+    return true;
+  };
+
+  // A deep link can also land on a page that is already open: Safari reuses a
+  // tab whose URL differs only by fragment (a hashchange, no reload), and a
+  // page restored from the back/forward cache comes back with its old state.
+  // Re-read the fragment on both and apply it against the state in hand, or
+  // leave it pending for the next state if none has arrived yet.
+  useEffect(() => {
+    const consume = () => {
+      const wanted = deepLinkSessionId(window.location.hash);
+      if (!wanted) return;
+      pendingDeepLinkRef.current = wanted;
+      applyPendingDeepLink(stateRef.current);
+    };
+    window.addEventListener('hashchange', consume);
+    window.addEventListener('pageshow', consume);
+    return () => {
+      window.removeEventListener('hashchange', consume);
+      window.removeEventListener('pageshow', consume);
+    };
+  }, []);
 
   // Keep screen awake
   useEffect(() => {
@@ -826,7 +900,7 @@ export default function App() {
     <div className="flex flex-col bg-[#0a0a0a] font-mono overflow-hidden select-none relative pt-safe pb-safe-root pl-safe pr-safe" style={{ height: '100dvh' }}>
 
       {/* ── Access Key Overlay ── */}
-      {(!accessKey || authError) && (
+      {authError && (
         <div
           className="fixed inset-0 z-[110] flex items-center justify-center px-5"
           style={{ backgroundColor: 'rgba(0,0,0,0.94)', backdropFilter: 'blur(10px)', WebkitBackdropFilter: 'blur(10px)' }}
@@ -842,7 +916,7 @@ export default function App() {
               <div>
                 <div className="text-[12px] font-bold tracking-[0.14em] text-zinc-200">ACCESS KEY REQUIRED</div>
                 <div className="mt-1 text-[10px] text-zinc-600">
-                  {authError ? 'That key was not accepted.' : 'Scan the server QR code or enter its key.'}
+                  {accessKey ? 'That key was not accepted.' : 'Scan the server QR code or enter its key.'}
                 </div>
               </div>
             </div>
@@ -868,7 +942,7 @@ export default function App() {
       )}
 
       {/* ── Reconnect Overlay ── */}
-      {accessKey && !authError && !connected && (
+      {!authError && !connected && (
         <div
           className="fixed inset-0 z-[100] flex flex-col items-center justify-center gap-3"
           style={{ backgroundColor: 'rgba(0,0,0,0.9)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)' }}
@@ -880,6 +954,15 @@ export default function App() {
             <div className="w-1.5 h-1.5 rounded-full bg-zinc-600 animate-bounce" style={{ animationDelay: '150ms' }} />
             <div className="w-1.5 h-1.5 rounded-full bg-zinc-600 animate-bounce" style={{ animationDelay: '300ms' }} />
           </div>
+        </div>
+      )}
+
+      {notice && (
+        <div
+          className="fixed left-1/2 z-[120] -translate-x-1/2 rounded-full border border-zinc-700 bg-zinc-900/95 px-4 py-2 text-[11px] text-zinc-300 shadow-xl"
+          style={{ top: 'calc(env(safe-area-inset-top, 0px) + 3.25rem)' }}
+        >
+          {notice}
         </div>
       )}
 

@@ -25,10 +25,24 @@ import socketio
 from aiohttp import web
 
 try:
-    from .auth import is_valid_key, load_or_create_key
+    from .auth import (
+        COOKIE_MAX_AGE,
+        COOKIE_NAME,
+        is_trusted_origin,
+        is_valid_key,
+        key_from_cookie_header,
+        load_or_create_key,
+    )
     from .geometry import pane_layout
 except ImportError:  # Running server.py directly from the server directory.
-    from auth import is_valid_key, load_or_create_key
+    from auth import (
+        COOKIE_MAX_AGE,
+        COOKIE_NAME,
+        is_trusted_origin,
+        is_valid_key,
+        key_from_cookie_header,
+        load_or_create_key,
+    )
     from geometry import pane_layout
 
 PORT = 7291
@@ -91,9 +105,14 @@ _CRITICAL_TASK_NAMES = {
 def log(*args) -> None:
     print(datetime.now().isoformat(timespec="seconds"), *args)
 
-sio = socketio.AsyncServer(async_mode="aiohttp", cors_allowed_origins="*")
-app = web.Application()
-sio.attach(app)
+def _origin_allowed(origin, environ) -> bool:
+    # Credentialed CORS (the auth cookie rides along) must not echo arbitrary
+    # origins; see is_trusted_origin. Engine.IO answers a disallowed origin
+    # with 400 and skips the check when there is no Origin header at all.
+    return is_trusted_origin(origin, environ.get("HTTP_HOST"))
+
+
+sio = socketio.AsyncServer(async_mode="aiohttp", cors_allowed_origins=_origin_allowed)
 
 clients: set[str] = set()
 
@@ -816,13 +835,20 @@ async def seed_client(sid: str) -> None:
 
 @sio.event
 async def connect(sid, environ, auth=None):
+    # Either the key in the Socket.IO auth payload (from localStorage or the
+    # QR URL fragment) or the HttpOnly cookie issued by /auth will do; the
+    # cookie is what keeps a phone working after Safari has purged the page's
+    # localStorage.
     supplied_key = auth.get("key") if isinstance(auth, dict) else None
-    if not is_valid_key(shared_key, supplied_key):
+    cookie_key = key_from_cookie_header(environ.get("HTTP_COOKIE"))
+    by_key = is_valid_key(shared_key, supplied_key)
+    if not (by_key or is_valid_key(shared_key, cookie_key)):
         log(f"Rejected unauthenticated client: {sid}")
         raise socketio.exceptions.ConnectionRefusedError("invalid access key")
     clients.add(sid)
     start_client_delivery(sid)
-    log(f"Client connected: {sid}")
+    agent = str(environ.get("HTTP_USER_AGENT", "?"))[:90]
+    log(f"Client connected: {sid} by {'key' if by_key else 'cookie'} ({agent})")
     # Seeding is deferred to a task because python-socketio only acknowledges
     # the connection once this handler returns, and seeding needs a dozen
     # iTerm2 RPCs. Inline, that made the Socket.IO handshake as slow as
@@ -1000,8 +1026,24 @@ async def on_rename_session(sid, data):
 async def on_focus(sid, data):
     if itermapp is None:
         return
+    # A specific pane (a notification deep link lands on one): one call selects
+    # the pane, its tab, and orders its window front. A pane that has since
+    # closed falls through to the window/tab the client asked for.
+    session_id = data.get("sessionId")
+    session = (itermapp.get_session_by_id(str(session_id))
+               if session_id and session_id != "undefined" else None)
+    if session is not None:
+        log(f"focus {sid}: pane {session_id}")
+        await session.async_activate(select_tab=True, order_window_front=True)
+        await itermapp.async_activate()
+        await push_state()
+        return
+
     window_id = data.get("windowId")
     tab_index = data.get("tabIndex") or 0
+    if session_id:
+        log(f"focus {sid}: pane {session_id} not found; "
+            f"falling back to window {window_id} tab {tab_index}")
     if not window_id:
         return
     window = itermapp.get_window_by_id(str(window_id))
@@ -1017,6 +1059,69 @@ async def on_focus(sid, data):
     await push_state()
 
 
+# --- Cookie credential ---------------------------------------------------------
+#
+# POST /auth {"key": ...} — or a request already carrying a valid cookie —
+# answers 204 and (re)issues the HttpOnly auth cookie with a fresh lifetime.
+# The client calls it on every successful connection, so the cookie's expiry
+# slides forward with use and never lapses on a phone that is used at all.
+
+def _cors_headers(request: web.Request) -> dict[str, str]:
+    origin = request.headers.get("Origin")
+    if not is_trusted_origin(origin, request.headers.get("Host")):
+        return {}
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+        "Vary": "Origin",
+    }
+
+
+async def auth_preflight(request: web.Request) -> web.Response:
+    headers = _cors_headers(request)
+    if not headers:
+        return web.Response(status=403, text="origin not allowed")
+    headers.update({
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Max-Age": "86400",
+    })
+    return web.Response(status=204, headers=headers)
+
+
+async def auth_issue_cookie(request: web.Request) -> web.Response:
+    headers = _cors_headers(request)
+    if request.headers.get("Origin") and not headers:
+        return web.Response(status=403, text="origin not allowed")
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    supplied_key = body.get("key") if isinstance(body, dict) else None
+    cookie_key = request.cookies.get(COOKIE_NAME)
+    if not (is_valid_key(shared_key, supplied_key)
+            or is_valid_key(shared_key, cookie_key)):
+        return web.Response(status=401, headers=headers, text="invalid access key")
+    response = web.Response(status=204, headers=headers)
+    response.set_cookie(
+        COOKIE_NAME, shared_key, max_age=COOKIE_MAX_AGE, path="/",
+        httponly=True, samesite="Lax")
+    return response
+
+
+def create_app() -> web.Application:
+    """The aiohttp application: the Socket.IO endpoint plus /auth.
+
+    Built per run rather than at import because an Application binds to the
+    event loop that first serves it, which lets tests spin one up per loop.
+    """
+    app = web.Application()
+    sio.attach(app)
+    app.router.add_route("OPTIONS", "/auth", auth_preflight)
+    app.router.add_post("/auth", auth_issue_cookie)
+    return app
+
+
 # --- Entry point ---------------------------------------------------------------
 
 async def main() -> None:
@@ -1029,7 +1134,7 @@ async def main() -> None:
     connection = await iterm2.Connection.async_create()
     itermapp = await iterm2.async_get_app(connection)
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(create_app())
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
