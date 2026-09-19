@@ -6,7 +6,7 @@
 // all exercised end to end. The page URL is a LAN address, the way a phone
 // loads it, so loopback links can be seen to be rewritten.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, cleanup, render, screen } from '@testing-library/react';
+import { act, cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import App from './App';
 import type { WindowState } from './types';
@@ -183,6 +183,116 @@ describe('smart typing', () => {
     expect(smartTypingToggle('Turn off autocorrect')).toBeTruthy();
     expect(commandBox().getAttribute('autocorrect')).toBe('on');
     expect(commandBox().getAttribute('autocapitalize')).toBe('none');
+  });
+});
+
+describe('the quick action keys', () => {
+  const row = (name: string) => screen.getByRole('group', { name });
+  const keysIn = (name: string) =>
+    within(row(name)).getAllByRole('button').map((b) => b.getAttribute('aria-label'));
+
+  it('are laid out as two rows, split after the arrows', () => {
+    render(<App />);
+    expect(keysIn('Control and arrow keys')).toEqual([
+      'ESC', '^C', '^D', '^Z', '^L', 'Up', 'Down', 'Left', 'Right',
+    ]);
+    expect(keysIn('Tab, return and clipboard')).toEqual([
+      'TAB', 'Return', 'Newline without sending', 'Paste', 'Copy pane', 'Clear line', 'Typing log',
+    ]);
+  });
+
+  it('never put a key behind a horizontal scroll', () => {
+    render(<App />);
+    for (const name of ['Control and arrow keys', 'Tab, return and clipboard']) {
+      // Neither the row nor anything it sits in may scroll sideways: a key
+      // off the edge of a strip is a key nobody knows is there.
+      let element: HTMLElement | null = row(name);
+      while (element) {
+        expect(element.className).not.toContain('overflow-x-auto');
+        element = element.parentElement;
+      }
+      // Each key divides the row instead of claiming a fixed width.
+      for (const key of within(row(name)).getAllByRole('button')) {
+        expect(key.className).toContain('flex-1');
+        expect(key.className).not.toContain('flex-shrink-0');
+      }
+    }
+  });
+});
+
+describe('closing a pane from the pane map', () => {
+  // Two panes side by side in the one tab, which is what makes the pane
+  // switcher — and its map — appear at all.
+  const twoPanes: WindowState[] = [{
+    id: 'w1',
+    isFront: true,
+    tabs: [{
+      index: 1, id: 'w1-1', isSelected: true, currentSessionId: 's1', aspect: 1.6,
+      sessions: [
+        { id: 's1', name: 'left', rect: { x: 0, y: 0, w: 0.5, h: 1 } },
+        { id: 's2', name: 'right', rect: { x: 0.5, y: 0, w: 0.5, h: 1 } },
+      ],
+    }],
+  }];
+
+  async function openMap() {
+    const user = userEvent.setup();
+    render(<App />);
+    act(() => latestSocket().receive('connect', undefined));
+    act(() => latestSocket().receive('state', twoPanes));
+    await user.click(screen.getByRole('button', { name: /PANE/ }));
+    return user;
+  }
+
+  const closeEmits = () => latestSocket().emitted.filter((e) => e.event === 'closePane');
+
+  it('asks before it closes, naming the pane it means', async () => {
+    const user = await openMap();
+    await user.click(screen.getByRole('button', { name: 'CLOSE PANE 1' }));
+
+    expect(screen.getByText('close pane 1 “left”?')).toBeTruthy();
+    expect(closeEmits()).toEqual([]);
+  });
+
+  it('closes the selected pane once the confirmation is taken', async () => {
+    const user = await openMap();
+    await user.click(screen.getByRole('button', { name: 'CLOSE PANE 1' }));
+    await user.click(screen.getByRole('button', { name: 'CLOSE' }));
+
+    expect(closeEmits()).toEqual([{ event: 'closePane', payload: { sessionId: 's1' } }]);
+  });
+
+  it('closes nothing when the confirmation is declined', async () => {
+    const user = await openMap();
+    await user.click(screen.getByRole('button', { name: 'CLOSE PANE 1' }));
+    await user.click(screen.getByRole('button', { name: 'KEEP' }));
+
+    expect(closeEmits()).toEqual([]);
+    // Back to the plain map, still open, still offering the close.
+    expect(screen.getByRole('button', { name: 'CLOSE PANE 1' })).toBeTruthy();
+  });
+
+  it('backs out of the confirmation when a pane is tapped instead', async () => {
+    const user = await openMap();
+    await user.click(screen.getByRole('button', { name: 'CLOSE PANE 1' }));
+    await user.click(screen.getByRole('button', { name: 'Pane 2 right' }));
+
+    // The tap disarmed rather than switching panes, so nothing was closed and
+    // the map still has pane 1 selected.
+    expect(closeEmits()).toEqual([]);
+    expect(screen.getByRole('button', { name: 'CLOSE PANE 1' })).toBeTruthy();
+  });
+
+  it('offers to close whichever pane is selected', async () => {
+    const user = await openMap();
+    // Tapping pane 2 selects it and dismisses the map; reopening it aims the
+    // close at the new selection.
+    await user.click(screen.getByRole('button', { name: 'Pane 2 right' }));
+    await user.click(screen.getByRole('button', { name: /PANE/ }));
+    await user.click(screen.getByRole('button', { name: 'CLOSE PANE 2' }));
+    await user.click(screen.getByRole('button', { name: 'CLOSE' }));
+
+    expect(closeEmits()).toEqual([{ event: 'closePane', payload: { sessionId: 's2' } }]);
   });
 });
 

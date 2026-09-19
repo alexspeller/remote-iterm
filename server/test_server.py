@@ -17,6 +17,7 @@ from server.server import (
     clients,
     delivery_wakeups,
     last_content,
+    on_close_pane,
     on_watch,
     palette_cache,
     pending_events,
@@ -217,6 +218,66 @@ class _FakeApp:
 
     def get_session_by_id(self, session_id):
         return self._session if session_id == self._session.session_id else None
+
+
+class _ClosableSession:
+    """iterm2.Session double that records how it was asked to close."""
+
+    def __init__(self, session_id="session-1"):
+        self.session_id = session_id
+        self.close_calls = []
+
+    async def async_close(self, force=False):
+        self.close_calls.append(force)
+
+
+class ClosePaneTest(unittest.IsolatedAsyncioTestCase):
+    """The pane map's close button is the only way to close a pane from the
+    phone, and it has already asked the user before this handler runs."""
+
+    async def test_closes_the_pane_the_phone_named(self):
+        session = _ClosableSession()
+        with patch.object(server_module, "itermapp", _FakeApp(session)), \
+             patch.object(server_module, "push_state", AsyncMock()):
+            await on_close_pane("sid", {"sessionId": "session-1"})
+
+        # force=True: without it iTerm puts a confirmation alert on the Mac
+        # for any pane with a running job, which nobody is there to answer
+        # and which blocks iTerm's main thread — and the API with it.
+        self.assertEqual(session.close_calls, [True])
+
+    async def test_a_stale_id_closes_nothing(self):
+        session = _ClosableSession()
+        with patch.object(server_module, "itermapp", _FakeApp(session)), \
+             patch.object(server_module, "push_state", AsyncMock()):
+            await on_close_pane("sid", {"sessionId": "already-gone"})
+
+        # Emphatically not a fallback to whatever iTerm has focused: that
+        # would make a stale tap close some unrelated pane.
+        self.assertEqual(session.close_calls, [])
+
+    async def test_a_missing_id_closes_nothing(self):
+        session = _ClosableSession()
+        with patch.object(server_module, "itermapp", _FakeApp(session)), \
+             patch.object(server_module, "push_state", AsyncMock()):
+            await on_close_pane("sid", {})
+            await on_close_pane("sid", None)
+
+        self.assertEqual(session.close_calls, [])
+
+    async def test_a_close_that_fails_is_survived(self):
+        class _Stubborn(_ClosableSession):
+            async def async_close(self, force=False):
+                raise RuntimeError("iTerm said no")
+
+        session = _Stubborn()
+        with patch.object(server_module, "itermapp", _FakeApp(session)), \
+             patch.object(server_module, "push_state", AsyncMock()) as push:
+            await on_close_pane("sid", {"sessionId": "session-1"})
+
+        # The phone still gets a fresh layout: it is waiting to be told what
+        # the tab looks like now.
+        push.assert_awaited_once()
 
 
 class ReadContentTransactionSafetyTest(unittest.IsolatedAsyncioTestCase):

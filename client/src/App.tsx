@@ -1101,7 +1101,9 @@ export default function App() {
   // way the map labels it: by its position in the grid.
   const selectedPaneIndex = primaryPanes.findIndex(pane => pane.id === selectedSessionId);
   const selectedPaneNumber = selectedPaneIndex >= 0 ? selectedPaneIndex + 1 : null;
-  const selectedPaneName = selectedPaneIndex >= 0 ? primaryPanes[selectedPaneIndex].name : '';
+  // Pane names are whatever the running program set the title to, which can
+  // be a whole command line; the question only needs enough to recognise it.
+  const selectedPaneName = (selectedPaneIndex >= 0 ? primaryPanes[selectedPaneIndex].name || '' : '').slice(0, 40);
 
   // All other sessions for split picker (exclude current active)
   const allSessions = useMemo(() => {
@@ -1502,25 +1504,27 @@ export default function App() {
           </div>
           {/* The footer is inside the dismiss-on-tap backdrop, so it has to
               stop its own clicks from bubbling out and closing the map. */}
-          <div className="mt-3 flex items-center gap-2 px-4" onClick={(e) => e.stopPropagation()}>
+          <div className="mt-3 flex flex-col items-center gap-2 px-4" onClick={(e) => e.stopPropagation()}>
             {paneCloseArmed ? (
               <>
-                <span className="text-[10px] tracking-wider" style={{ color: DANGER }}>
+                <span className="text-[10px] tracking-wider text-center" style={{ color: DANGER }}>
                   close pane {selectedPaneNumber}{selectedPaneName ? ` “${selectedPaneName}”` : ''}?
                 </span>
-                <button
-                  onClick={() => setPaneCloseArmed(false)}
-                  className="px-3 h-8 rounded-lg border border-zinc-700 text-[10px] font-bold tracking-wider text-zinc-400 active:scale-95 transition-all"
-                >
-                  KEEP
-                </button>
-                <button
-                  onClick={handleClosePane}
-                  className="px-3 h-8 rounded-lg border text-[10px] font-bold tracking-wider active:scale-95 transition-all"
-                  style={{ borderColor: DANGER, backgroundColor: DANGER + '20', color: DANGER }}
-                >
-                  CLOSE
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setPaneCloseArmed(false)}
+                    className="px-4 h-9 rounded-lg border border-zinc-700 text-[10px] font-bold tracking-wider text-zinc-400 whitespace-nowrap active:scale-95 transition-all"
+                  >
+                    KEEP
+                  </button>
+                  <button
+                    onClick={handleClosePane}
+                    className="px-4 h-9 rounded-lg border text-[10px] font-bold tracking-wider whitespace-nowrap active:scale-95 transition-all"
+                    style={{ borderColor: DANGER, backgroundColor: DANGER + '20', color: DANGER }}
+                  >
+                    CLOSE
+                  </button>
+                </div>
               </>
             ) : (
               <>
@@ -1528,10 +1532,10 @@ export default function App() {
                 {selectedPaneNumber !== null && (
                   <button
                     onClick={() => setPaneCloseArmed(true)}
-                    className="flex items-center gap-1 px-2.5 h-8 rounded-lg border text-[10px] font-bold tracking-wider active:scale-95 transition-all"
+                    className="flex items-center gap-1.5 px-4 h-9 rounded-lg border text-[10px] font-bold tracking-wider whitespace-nowrap active:scale-95 transition-all"
                     style={{ borderColor: DANGER + '40', backgroundColor: DANGER + '12', color: DANGER }}
                   >
-                    <X className="w-3 h-3" />
+                    <X className="w-3 h-3 flex-shrink-0" />
                     CLOSE PANE {selectedPaneNumber}
                   </button>
                 )}
