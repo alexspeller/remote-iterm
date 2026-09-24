@@ -10,6 +10,7 @@ its output — and writes:
   <support>/snapshots/latest/layout.txt   human-readable ASCII layout + table
   <support>/snapshots/latest/state.json   full structured snapshot (for restore)
   <support>/snapshots/latest/panes/*.txt   per-pane ~200-line plain-text tail
+  <support>/snapshots/latest/panes/*.ansi  the same tail with its ANSI colours
   <support>/snapshots/history/DATE.jsonl   one changed layout+metadata record/line
 
 where <support> is ~/Library/Application Support/remote-iterm. History keeps
@@ -39,9 +40,11 @@ import iterm2.rpc
 try:
     from .ascii_layout import render as render_ascii
     from .geometry import pane_layout, serialize_tree
+    from .terminal_lines import ansi_text, async_get_lines, plain_text
 except ImportError:  # Running directly from the server directory.
     from ascii_layout import render as render_ascii
     from geometry import pane_layout, serialize_tree
+    from terminal_lines import ansi_text, async_get_lines, plain_text
 
 SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "remote-iterm"
 SNAPSHOT_DIR = SUPPORT_DIR / "snapshots"
@@ -205,6 +208,20 @@ async def connection_watchdog(connection, stop: asyncio.Event) -> None:
             pass
 
 
+def tail_texts(lines) -> tuple[str, str]:
+    """(plain, styled) text of buffer lines, minus leading/trailing blank lines.
+
+    Both hold the same lines, so line N of one is line N of the other.
+    """
+    plain = [plain_text(line) for line in lines]
+    kept = [i for i, text in enumerate(plain) if text]
+    if not kept:
+        return "", ""
+    lo, hi = kept[0], kept[-1] + 1
+    return ("\n".join(plain[lo:hi]),
+            "\n".join(ansi_text(line) for line in lines[lo:hi]))
+
+
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=path.suffix)
@@ -228,9 +245,9 @@ class Snapshotter:
         # tab_id -> {"rects", "aspect", "tree"} last captured while NOT maximized,
         # so a currently-maximized tab still renders/restores its real layout.
         self.last_good: dict[str, dict] = {}
-        # session_id -> (monotonic_ts, text) so rapid triggers don't re-read all
-        # panes; the heartbeat keeps them fresh.
-        self.content_cache: dict[str, tuple[float, str]] = {}
+        # session_id -> (monotonic_ts, (plain, styled)) so rapid triggers don't
+        # re-read all panes; the heartbeat keeps them fresh.
+        self.content_cache: dict[str, tuple[float, tuple[str, str]]] = {}
         # session_id -> profile custom initial directory ("" if not custom). Read
         # once; a profile's working-directory setting doesn't change per session.
         self.custom_dir_cache: dict[str, str] = {}
@@ -238,7 +255,8 @@ class Snapshotter:
 
     # --- content -----------------------------------------------------------
 
-    async def _read_tail(self, session, n: int = TAIL_LINES) -> str:
+    async def _read_tail(self, session, n: int = TAIL_LINES) -> tuple[str, str]:
+        """The pane's last ``n`` lines as (plain text, text with ANSI colour)."""
         try:
             # Not wrapped in an iterm2.Transaction: a transaction blocks
             # iTerm2's entire main thread until explicitly ended, and this
@@ -255,22 +273,21 @@ class Snapshotter:
             first = max(available_first, terminal_end - n)
             count = terminal_end - first
             if count <= 0:
-                return ""
-            lines = await session.async_get_contents(first, count)
-            text = "\n".join(line.string.rstrip() for line in lines)
-            return text.strip("\n")
+                return "", ""
+            lines = await async_get_lines(session, first, count)
+            return tail_texts(lines)
         except Exception as err:
             log(f"content read failed for {session.session_id}: {err}")
-            return ""
+            return "", ""
 
-    async def _content_for(self, session) -> str:
+    async def _content_for(self, session) -> tuple[str, str]:
         now = time.monotonic()
         cached = self.content_cache.get(session.session_id)
         if cached is not None and now - cached[0] < CONTENT_TTL_SECONDS:
             return cached[1]
-        text = await self._read_tail(session)
-        self.content_cache[session.session_id] = (now, text)
-        return text
+        texts = await self._read_tail(session)
+        self.content_cache[session.session_id] = (now, texts)
+        return texts
 
     async def _custom_dir(self, session) -> str:
         """The pane's profile custom initial directory (e.g. a ~/bin/project
@@ -309,7 +326,8 @@ class Snapshotter:
             cols, rows = int(grid.width), int(grid.height)
         except Exception:
             cols, rows = 0, 0
-        content = await self._content_for(session)
+        content, styled = await self._content_for(session)
+        stem = f"panes/{_safe_id(session.session_id)}"
         entry = {
             "id": session.session_id,
             "name": session.name or "",
@@ -323,8 +341,12 @@ class Snapshotter:
                       "w": round(rect[2], 4), "h": round(rect[3], 4)}
                      if rect is not None else None),
             "contentLines": content.count("\n") + 1 if content else 0,
-            "contentFile": f"panes/{_safe_id(session.session_id)}.txt" if content else None,
+            "contentFile": f"{stem}.txt" if content else None,
+            # The same lines with their colours, as ANSI escapes; what restore
+            # replays. The plain file stays for reading and grepping.
+            "styledFile": f"{stem}.ansi" if content else None,
             "_content": content,  # stripped before serialization; written to panes/
+            "_styled": styled,
         }
         return entry
 
@@ -421,14 +443,18 @@ class Snapshotter:
             for tab in window["tabs"]:
                 for pane in tab["panes"]:
                     content = pane.pop("_content", "")
+                    styled = pane.pop("_styled", "")
+                    stem = _safe_id(pane["id"])
                     if content:
-                        fname = f"{_safe_id(pane['id'])}.txt"
-                        _atomic_write(PANES_DIR / fname, content + "\n")
-                        live_files.add(fname)
+                        _atomic_write(PANES_DIR / f"{stem}.txt", content + "\n")
+                        live_files.add(f"{stem}.txt")
+                    if styled:
+                        _atomic_write(PANES_DIR / f"{stem}.ansi", styled + "\n")
+                        live_files.add(f"{stem}.ansi")
                 tab["layout"] = render_tab_layout(tab)
         # Drop stale pane files for panes that no longer exist.
-        for existing in PANES_DIR.glob("*.txt"):
-            if existing.name not in live_files:
+        for existing in PANES_DIR.iterdir():
+            if existing.suffix in (".txt", ".ansi") and existing.name not in live_files:
                 try:
                     existing.unlink()
                 except OSError:

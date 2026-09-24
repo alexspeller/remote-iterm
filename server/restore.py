@@ -72,25 +72,40 @@ def running_command(meta) -> str:
     return ""
 
 
+def pane_content(meta, content_dir) -> str:
+    """A pane's saved output, ready to echo back into a terminal.
+
+    Prefers the colour-preserving ``styledFile``; archives written before it
+    existed only have the plain ``contentFile``. Those can hold the NULs iTerm2
+    reports for cells a program skipped over, which a terminal drops, so they
+    become the spaces they looked like.
+    """
+    if not meta or content_dir is None:
+        return ""
+    for key in ("styledFile", "contentFile"):
+        ref = meta.get(key)
+        if not ref:
+            continue
+        try:
+            content = (content_dir / ref).read_text(errors="replace")
+        except OSError:
+            continue
+        return content.replace("\x00", " ")
+    return ""
+
+
 async def _configure(session, meta, content_dir) -> None:
     if not meta:
         return
     cwd = meta.get("cwd") or ""
     cmd = running_command(meta)
-    content = ""
-    ref = meta.get("contentFile")
-    if ref and content_dir is not None:
-        path = content_dir / ref
-        try:
-            if path.exists():
-                content = path.read_text(errors="replace")
-        except OSError:
-            content = ""
+    content = pane_content(meta, content_dir).rstrip("\n")
 
     parts = []
     if content:
         parts.append("\r\n\x1b[2m─── restored pane · previous output ───\x1b[0m\r\n")
         parts.append(content.replace("\r\n", "\n").replace("\n", "\r\n"))
+        parts.append("\x1b[0m\r\n")
     if cmd:
         # Bold, on its own line, with no trailing box rule — a long command line
         # then wraps cleanly instead of orphaning "───" onto the next row. This

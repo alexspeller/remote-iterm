@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 from server import snapshot as S
 from server.restore import pane_ids, split_count
+from server.test_terminal_lines import line
 
 
 def make_clean(cwd="/Users/x/proj", captured="2026-08-19T10:00:00+00:00"):
@@ -30,6 +31,7 @@ def make_clean(cwd="/Users/x/proj", captured="2026-08-19T10:00:00+00:00"):
                     "cmd": "vim file", "cols": 80, "rows": 24,
                     "rect": {"x": 0, "y": 0, "w": 1, "h": 1},
                     "contentFile": "panes/p_A.txt", "contentLines": 3,
+                    "styledFile": "panes/p_A.ansi",
                 }],
             }],
         }],
@@ -50,6 +52,7 @@ class HelperTest(unittest.TestCase):
         rec = S._history_record(make_clean())
         pane = rec["windows"][0]["tabs"][0]["panes"][0]
         self.assertNotIn("contentFile", pane)
+        self.assertNotIn("styledFile", pane)
         self.assertNotIn("contentLines", pane)
         self.assertNotIn("_content", pane)
         self.assertIn("cwd", pane)
@@ -63,6 +66,63 @@ class HelperTest(unittest.TestCase):
         self.assertIn("Tab 1: proj", text)
         self.assertIn("* ", text)          # focused-pane marker
         self.assertIn("$ vim file", text)  # last command in the table
+
+
+class TailTextsTest(unittest.TestCase):
+    def test_plain_and_styled_hold_the_same_lines(self):
+        lines = [
+            line([]),
+            line(["\x00", "\x00"]),
+            line(list("ok") + ["\x00"] + list("go"),
+                 [({"fgStandard": 2}, 2), ({}, 3)]),
+            line([]),
+            line(list("next")),
+            line([" ", " "]),
+        ]
+        plain, styled = S.tail_texts(lines)
+        # Blank lines at either end are dropped, ones in the middle kept; the
+        # cell Claude Code skipped over reads as the space it looked like.
+        self.assertEqual(plain, "ok go\n\nnext")
+        self.assertEqual(styled, "\x1b[0;32mok\x1b[0m go\n\nnext")
+
+    def test_an_empty_pane_has_no_text(self):
+        self.assertEqual(S.tail_texts([line([]), line(["\x00"])]), ("", ""))
+
+
+class WriteLatestTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self._orig = (S.LATEST_DIR, S.PANES_DIR)
+        S.LATEST_DIR = root / "latest"
+        S.PANES_DIR = S.LATEST_DIR / "panes"
+
+    def tearDown(self):
+        S.LATEST_DIR, S.PANES_DIR = self._orig
+        self._tmp.cleanup()
+
+    def test_writes_plain_and_styled_content_and_drops_stale_files(self):
+        S.PANES_DIR.mkdir(parents=True)
+        (S.PANES_DIR / "gone.txt").write_text("old\n")
+        (S.PANES_DIR / "gone.ansi").write_text("old\n")
+        snap = make_clean()
+        pane = snap["windows"][0]["tabs"][0]["panes"][0]
+        pane["_content"] = "red text"
+        pane["_styled"] = "\x1b[0;31mred\x1b[0m text"
+
+        clean = S.Snapshotter(None, None)._write_latest(snap)
+
+        self.assertEqual((S.PANES_DIR / "p_A.txt").read_text(), "red text\n")
+        self.assertEqual((S.PANES_DIR / "p_A.ansi").read_text(),
+                         "\x1b[0;31mred\x1b[0m text\n")
+        self.assertEqual(sorted(p.name for p in S.PANES_DIR.iterdir()),
+                         ["p_A.ansi", "p_A.txt"])
+        state = json.loads((S.LATEST_DIR / "state.json").read_text())
+        saved = state["windows"][0]["tabs"][0]["panes"][0]
+        self.assertEqual(saved["styledFile"], "panes/p_A.ansi")
+        self.assertNotIn("_content", saved)
+        self.assertNotIn("_styled", saved)
+        self.assertNotIn("_styled", clean["windows"][0]["tabs"][0]["panes"][0])
 
 
 class GridTreeTest(unittest.TestCase):

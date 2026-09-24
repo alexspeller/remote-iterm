@@ -1,6 +1,8 @@
+import tempfile
 import unittest
+from pathlib import Path
 
-from server.restore import (clean_title, pane_ids, plan_text,
+from server.restore import (clean_title, pane_content, pane_ids, plan_text,
                             running_command, split_count)
 
 PANE = lambda i: {"type": "pane", "id": i}  # noqa: E731
@@ -69,6 +71,40 @@ class RestorePureTest(unittest.TestCase):
         self.assertIn("/x", text)
         self.assertIn("$ vim", text)
         self.assertIn("1 splits", text)
+
+
+class PaneContentTest(unittest.TestCase):
+    META = {"contentFile": "panes/p.txt", "styledFile": "panes/p.ansi"}
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        (self.dir / "panes").mkdir()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_replays_the_colours_when_they_were_saved(self):
+        (self.dir / "panes" / "p.txt").write_text("red text\n")
+        (self.dir / "panes" / "p.ansi").write_text("\x1b[0;31mred\x1b[0m text\n")
+        self.assertEqual(pane_content(self.META, self.dir),
+                         "\x1b[0;31mred\x1b[0m text\n")
+
+    def test_an_older_archive_restores_with_its_spaces(self):
+        # Archives from before styled content exist have only the plain file,
+        # which kept the NULs iTerm2 reports for cells Claude Code skipped.
+        (self.dir / "panes" / "p.txt").write_text(
+            "Confirmed\x00genuinely\x00NOT\x00fixed\n")
+        self.assertEqual(pane_content({"contentFile": "panes/p.txt"}, self.dir),
+                         "Confirmed genuinely NOT fixed\n")
+        # ...and so does one whose styled file has gone missing.
+        self.assertEqual(pane_content(self.META, self.dir),
+                         "Confirmed genuinely NOT fixed\n")
+
+    def test_nothing_to_replay(self):
+        self.assertEqual(pane_content(self.META, None), "")
+        self.assertEqual(pane_content({}, self.dir), "")
+        self.assertEqual(pane_content(self.META, self.dir), "")
 
 
 if __name__ == "__main__":

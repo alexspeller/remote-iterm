@@ -102,7 +102,7 @@ For the component model, data flow, Socket.IO contract, and design trade-offs, s
 remote-iterm continuously records your full iTerm2 layout so you can recover it after a crash or accidental quit. An independent snapshotter (started alongside the server) writes, on every layout/focus change and a periodic heartbeat:
 
 - an **ASCII map** of every window, tab, and pane (`latest/layout.txt`) — including all panes of a maximized tab,
-- a structured snapshot for restore (`latest/state.json`) and a ~200-line plain-text tail of each pane (`latest/panes/`),
+- a structured snapshot for restore (`latest/state.json`) and a ~200-line tail of each pane (`latest/panes/`), both as plain text and with its colours,
 - a 14-day **history** of layout + metadata (`history/<date>.jsonl`).
 
 **Surviving a crash.** The catch a naïve snapshotter would hit: when you reopen iTerm2 after a crash, the snapshotter starts capturing the *new* (blank) session and would overwrite the good one. To avoid that, at startup — **before** it captures anything — the snapshotter archives the outgoing `latest/` (with its content) into `sessions/<timestamp>/`. So the pre-crash session is preserved intact, and `iterm-snapshot restore` defaults to **that last completed session**, not the blank one you just opened. The last 20 sessions (within 14 days) are kept.
@@ -170,7 +170,8 @@ mise exec -- npm --prefix client test
 # After ./iterm-server has created server/.venv
 mise exec -- server/.venv/bin/python -m unittest \
   server.test_server server.test_auth server.test_geometry \
-  server.test_ascii_layout server.test_snapshot server.test_restore
+  server.test_ascii_layout server.test_snapshot server.test_restore \
+  server.test_terminal_lines
 ```
 
 The snapshot, geometry, ASCII-layout, and restore unit tests are pure Python and need neither a phone nor a running iTerm2. The client tests run under vitest: the deep-link parsing is pure, and the command-box tests render the real `App` in jsdom with only the socket faked.
