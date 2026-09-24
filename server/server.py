@@ -37,6 +37,7 @@ try:
         load_or_create_key,
     )
     from .geometry import pane_layout
+    from .terminal_lines import async_get_lines
 except ImportError:  # Running server.py directly from the server directory.
     from auth import (
         COOKIE_MAX_AGE,
@@ -47,6 +48,7 @@ except ImportError:  # Running server.py directly from the server directory.
         load_or_create_key,
     )
     from geometry import pane_layout
+    from terminal_lines import async_get_lines
 
 PORT = 7291
 
@@ -705,7 +707,10 @@ async def read_content(
                 "terminalEnd": terminal_end,
                 "isLatest": before_line is None,
             }
-        lines = await session.async_get_contents(first, count)
+        # Not session.async_get_contents: its per-cell text shifts by one
+        # after every emoji outside the Basic Multilingual Plane (see
+        # terminal_lines), which misaligns colours and drops the line's end.
+        lines = await async_get_lines(session, first, count)
         cursor = screen.cursor_coord
         rendered = [
             _line_runs(line, pal, cursor.x if first + i == cursor.y else None)

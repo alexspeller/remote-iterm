@@ -14,7 +14,9 @@ def proto_line(cells, styles=None):
 
     ``cells`` is each cell's text; iTerm2 measures it in UTF-16 code units.
     ``styles`` is a list of (CellStyle fields, number of cells) runs covering
-    the line; omitted, every cell has the default style.
+    the line; omitted, every cell has the default style. A run given no
+    foreground or background gets the default one, which iTerm2 always sends
+    as an alternate colour rather than leaving it out.
     """
     proto = api_pb2.LineContents()
     proto.text = "".join(cells)
@@ -27,6 +29,9 @@ def proto_line(cells, styles=None):
             runs.add(num_code_points=units, repeats=1)
     for fields, count in styles or [({}, len(cells))]:
         style = proto.style.add(repeats=count)
+        for side in ("fg", "bg"):
+            if not any(name.startswith(side) for name in fields):
+                setattr(style, side + "Alternate", api_pb2.DEFAULT)
         for name, value in fields.items():
             if name in ("fgRgb", "bgRgb", "underlineColor"):
                 getattr(style, name).CopyFrom(api_pb2.RGBColor(

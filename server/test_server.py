@@ -7,6 +7,7 @@ import socketio
 
 import server.server as server_module
 from server.auth import COOKIE_MAX_AGE, COOKIE_NAME
+from server.test_terminal_lines import DWC_RIGHT, line as proto_backed_line
 from server.server import (
     _DEFAULT_PALETTE,
     _apply_links,
@@ -108,6 +109,18 @@ class LineRunsTest(unittest.TestCase):
     def test_osc8_links_a_phone_cannot_open_stay_plain_text(self):
         line = _Line("notes.txt", linked={(0, 9): "file:///Users/alex/notes.txt"})
         self.assertEqual(_line_runs(line, _DEFAULT_PALETTE), [{"t": "notes.txt"}])
+
+    def test_text_after_an_emoji_keeps_its_own_colour_and_end(self):
+        # A line as iTerm2 sends it: the wide emoji is two UTF-16 units and
+        # two cells, and the text after it is bold.
+        line = proto_backed_line(
+            ["│", " ", "📣", DWC_RIGHT, " ", "J", "i", "r", "a"],
+            [({}, 2), ({"fgStandard": 1}, 2), ({"bold": True}, 5)])
+        self.assertEqual(
+            _line_runs(line, _DEFAULT_PALETTE),
+            [{"t": "│ "}, {"t": "📣", "f": "#cd0000"},
+             {"t": " Jira", "b": True}],
+        )
 
 
 class AutolinkTest(unittest.TestCase):
@@ -212,6 +225,11 @@ class _FakeSession:
         return self._lines[first:first + count]
 
 
+async def _fake_get_lines(session, first, count):
+    """Stands in for terminal_lines.async_get_lines, which reads over RPC."""
+    return await session.async_get_contents(first, count)
+
+
 class _FakeApp:
     def __init__(self, session):
         self._session = session
@@ -298,6 +316,7 @@ class ReadContentTransactionSafetyTest(unittest.IsolatedAsyncioTestCase):
     async def test_normal_read_never_opens_a_transaction(self):
         session = _FakeSession([_Line("hello")])
         with patch.object(server_module, "itermapp", _FakeApp(session)), \
+             patch.object(server_module, "async_get_lines", _fake_get_lines), \
              patch("iterm2.rpc.async_start_transaction",
                    side_effect=AssertionError("must not open a transaction")):
             result = await read_content("session-1")
@@ -309,6 +328,7 @@ class ReadContentTransactionSafetyTest(unittest.IsolatedAsyncioTestCase):
         gate = asyncio.Event()  # never set: async_get_contents blocks forever
         session = _FakeSession([_Line("hello")], contents_gate=gate)
         with patch.object(server_module, "itermapp", _FakeApp(session)), \
+             patch.object(server_module, "async_get_lines", _fake_get_lines), \
              patch("iterm2.rpc.async_start_transaction",
                    side_effect=AssertionError("must not open a transaction")):
             task = asyncio.create_task(read_content("session-1"))
@@ -330,7 +350,8 @@ class ReadContentLinksTest(unittest.IsolatedAsyncioTestCase):
             _Line("open https://example.com/very/lo", hard_eol=False),
             _Line("ng/path now"),
         ])
-        with patch.object(server_module, "itermapp", _FakeApp(session)):
+        with patch.object(server_module, "itermapp", _FakeApp(session)), \
+             patch.object(server_module, "async_get_lines", _fake_get_lines):
             result = await read_content("session-1")
 
         url = "https://example.com/very/long/path"
