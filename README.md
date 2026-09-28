@@ -27,6 +27,7 @@ The unqualified `npm install -g remote-iterm` package belongs to the upstream pr
 remote-iterm          # start
 remote-iterm stop     # stop
 remote-iterm restart  # restart
+remote-iterm restart-server  # restart only the phone server (what the phone's restart button does)
 remote-iterm url      # print the URLs and QR code again
 ```
 
@@ -93,6 +94,10 @@ For the component model, data flow, Socket.IO contract, and design trade-offs, s
 - Clipboard paste and terminal-output copy
 - Landscape layout and iPhone safe-area handling
 - Connection latency indicator and instant, quiet automatic reconnect (a banner only if the outage outlasts a couple of seconds)
+- Typing that survives a dropped connection: every keystroke and command is kept until iTerm2 has it, resent if the connection swallowed it, and never typed twice; an hourglass counter shows what is still on its way
+- An ITERM2 NOT RESPONDING banner, with a running time, when iTerm2 itself stops answering (a Mac short of memory can stall it for over a minute) — so a frozen screen is explained rather than mysterious
+- A server restart button, which works even when the server it restarts is wedged
+- Split the selected pane vertically or horizontally from the pane map
 - Screen wake lock, scroll lock, and optional completion vibration
 - Installable PWA
 - Continuous state snapshots for crash recovery, with an ASCII layout map and one-command restore
@@ -171,7 +176,7 @@ mise exec -- npm --prefix client test
 mise exec -- server/.venv/bin/python -m unittest \
   server.test_server server.test_auth server.test_geometry \
   server.test_ascii_layout server.test_snapshot server.test_restore \
-  server.test_terminal_lines
+  server.test_terminal_lines server.test_live_tail server.test_resilience
 ```
 
 The snapshot, geometry, ASCII-layout, and restore unit tests are pure Python and need neither a phone nor a running iTerm2. The client tests run under vitest: the deep-link parsing is pure, and the command-box tests render the real `App` in jsdom with only the socket faked.
@@ -181,7 +186,7 @@ The backend requires a running iTerm2 instance and permission to use its Python 
 ## Ports and local files
 
 - `7291` — Python Socket.IO server
-- `7292` — web client (the static build in `client/dist`, served by `vite preview`)
+- `7292` — web client (the static build in `client/dist`, served by `vite preview`), and `POST /api/restart-server` for the phone's restart button
 - `.iterm-server.pid` — backend and client process IDs
 - `.iterm-server.log` — combined server and client log, including every client's connect peer, disconnect reason, and the client's own `hello` report of how its previous connection ended (see [Diagnosing reconnects](docs/ARCHITECTURE.md#diagnosing-reconnects))
 - `server/.venv` — automatically managed Python environment

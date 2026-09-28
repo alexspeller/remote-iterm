@@ -33,6 +33,9 @@ CLIENT_START_SECONDS=${CLIENT_START_SECONDS:-120}
 
 now_seconds() { date +%s; }
 
+# Whether `start` ends by printing the QR code and key-bearing URLs.
+PRINT_URLS=1
+
 # Serializes start/stop/restart against each other. Needed because the
 # AutoLaunch supervisor now polls every 5s (see autolaunch/remote-iterm.py)
 # and calls `start` whenever anything looks down — including the few-second
@@ -355,7 +358,8 @@ do_start() {
       echo "  Client did not start — see $LOGFILE" >&2
   fi
 
-  print_urls "$shared_key"
+  [ "$PRINT_URLS" = 1 ] && print_urls "$shared_key"
+  return 0
 }
 
 # The QR code and both URLs for the running stack. `url` prints them on
@@ -454,6 +458,61 @@ do_restart() {
   do_start
 }
 
+# Restart only the phone server (7291): what the phone's restart button runs,
+# through the web client's process (client/server/restartEndpoint.ts). That
+# process and the snapshotter are left alone — the page stays loadable while
+# the server comes back, and restarting the snapshotter would archive the live
+# session for nothing. do_start then starts just what is down.
+#
+# Only this stack's server is touched — whatever holds 7291, and the server
+# pid in the pidfile — never any other `python -u server.py` on the Mac. The
+# URLs are not printed: this runs from the web client, with its output going
+# to the world-readable log, and they carry the access key.
+do_restart_server() {
+  local pid pids="" server_pid="" deadline
+  if [ -f "$PIDFILE" ]; then
+    read -r server_pid _ < "$PIDFILE"
+  fi
+  if _pid_alive_running "$server_pid" "server.py"; then
+    pids="$server_pid"
+  fi
+  for pid in $(lsof -nP -tiTCP:7291 -sTCP:LISTEN 2>/dev/null); do
+    case " $pids " in *" $pid "*) ;; *) pids="$pids $pid" ;; esac
+  done
+  for pid in $pids; do
+    kill "$pid" 2>/dev/null
+  done
+  # server.py bounds its own shutdown (SHUTDOWN_TIMEOUT, 10s); past that it is
+  # stuck, and a restart is what was asked for.
+  deadline=$(( $(now_seconds) + 12 ))
+  while :; do
+    local alive=""
+    for pid in $pids; do
+      kill -0 "$pid" 2>/dev/null && alive="$alive $pid"
+    done
+    [ -z "$alive" ] && ! port_listening 7291 && break
+    if [ "$(now_seconds)" -ge "$deadline" ]; then
+      for pid in $alive $(lsof -nP -tiTCP:7291 -sTCP:LISTEN 2>/dev/null); do
+        echo "  Phone server $pid did not stop — killing it"
+        kill -9 "$pid" 2>/dev/null
+      done
+      # Wait for SIGKILL to land, or do_start would adopt the dying process
+      # as one still starting up.
+      deadline=$(( $(now_seconds) + 5 ))
+      for pid in $alive; do
+        while kill -0 "$pid" 2>/dev/null && [ "$(now_seconds)" -lt "$deadline" ]; do
+          sleep 0.1
+        done
+      done
+      break
+    fi
+    sleep 0.2
+  done
+  echo "  Phone server stopped"
+  PRINT_URLS=0
+  do_start
+}
+
 # Every invocation is recorded with its caller, so a stack that keeps getting
 # restarted can be traced to whoever is doing it (`ps` on the parent pid).
 log_invocation() {
@@ -469,6 +528,7 @@ case "${1:-start}" in
   start)   with_lock do_start ;;
   stop)    with_lock do_stop ;;
   restart) with_lock do_restart ;;
+  restart-server) with_lock do_restart_server ;;
   url)     do_url ;;
-  *)       echo "Usage: iterm-server [start|stop|restart|url]" ;;
+  *)       echo "Usage: iterm-server [start|stop|restart|restart-server|url]" ;;
 esac

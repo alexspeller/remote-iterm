@@ -1,10 +1,11 @@
 import { useState, useEffect, useLayoutEffect, useRef, useMemo, memo } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, Rows2, LayoutGrid, List as ListIcon, KeyRound, ScrollText, SpellCheck2 } from 'lucide-react';
+import { Plus, X, Send, Clock, ChevronUp, ChevronDown, ChevronLeft, ChevronRight, CornerDownLeft, Trash2, Keyboard, Terminal, Lock, Unlock, Radio, Bell, Clipboard, Copy, WifiOff, Columns2, Rows2, LayoutGrid, List as ListIcon, KeyRound, ScrollText, SpellCheck2, RotateCw, Hourglass, TriangleAlert } from 'lucide-react';
 
 import type { Session, Tab, WindowState, ScreenSize } from './types';
 import { deepLinkSessionId, findSessionLocation, stripDeepLink } from './deepLink';
 import { linkHref } from './links';
+import { InputQueue, LEGACY_SERVER, parseFailures, type InputKind, type PendingInput } from './inputQueue';
 
 // --- Types ---
 
@@ -46,6 +47,27 @@ const MAX_TYPING_LOG_CHARS = 20000;
 // reserved for an outage the user actually needs to know about.
 const RECONNECT_BANNER_DELAY_MS = 2500;
 const BOTTOM_THRESHOLD_PX = 4;
+// Lines kept per pane. A pane followed live used to keep every line that
+// scrolled past for as long as the page was open, and each frame re-rendered
+// all of them — hours of a busy pane made the page sluggish enough to drop
+// typing. Older lines are fetched again on demand when scrolling up.
+const MAX_RETAINED_LINES = 1000;
+// Input the server has not confirmed for this long gets a visible counter.
+const PENDING_BADGE_DELAY_MS = 800;
+// A liveness ping unanswered this long means the socket is dead, whatever it
+// claims; it is dropped and reconnected rather than left for Engine.IO's own
+// ping timeout (45s) to notice.
+const PING_DEAD_MS = 8000;
+// Commands sent but not yet taken by the server, kept across a reload.
+const UNCONFIRMED_KEY = 'remote-iterm-unconfirmed';
+const RESTART_URL = '/api/restart-server';
+// How long to wait for a server to say which process it is before taking it
+// for one too old to (see inputQueue.ts).
+const LEGACY_SERVER_WAIT_MS = 3000;
+// Emits a dead socket's buffer must not carry onto the next connection.
+const UNBUFFERED_EVENTS = new Set(['execute', 'sendKeys', 'broadcast', 'ping']);
+// A restart that has not produced a new server by then is reported.
+const RESTART_WAIT_MS = 90_000;
 const DIRECT_INPUT_KEYS: Record<string, string> = {
   Enter: '\r',
   Backspace: '\x7f',
@@ -230,6 +252,16 @@ function appendTypingLog(current: string, text: string, newLine: boolean): strin
   return next;
 }
 
+function sameRuns(a: Run[], b: Run[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  return a.every((run, i) => {
+    const other = b[i];
+    return run.t === other.t && run.f === other.f && run.g === other.g && run.b === other.b
+      && run.d === other.d && run.c === other.c && run.u === other.u;
+  });
+}
+
 function mergeStyledContent(current: StyledContent | undefined, incoming: StyledContent): StyledContent {
   if (!current) return incoming;
 
@@ -250,18 +282,23 @@ function mergeStyledContent(current: StyledContent | undefined, incoming: Styled
   );
   const lines: Run[][] = Array.from({ length: Math.max(0, endLine - firstLine) }, () => []);
 
-  const copy = (source: Run[][], sourceFirst: number, removeCursor: boolean) => {
+  const copy = (source: Run[][], sourceFirst: number, removeCursor: boolean, keepEqual: boolean) => {
     source.forEach((runs, index) => {
       const target = sourceFirst + index - firstLine;
       if (target < 0 || target >= lines.length) return;
-      lines[target] = removeCursor ? runs.filter(run => !run.c) : runs;
+      const existing = lines[target];
+      if (keepEqual && existing.length && sameRuns(existing, runs)) return;
+      lines[target] = removeCursor && runs.some(run => run.c) ? runs.filter(run => !run.c) : runs;
     });
   };
 
   // A live update carries the current cursor, so remove the stale cursor from
-  // any preserved history before overwriting the recent tail.
-  copy(current.lines, current.firstLine, incoming.isLatest);
-  copy(incoming.lines, incoming.firstLine, false);
+  // any preserved history before overwriting the recent tail. Every line that
+  // did not change keeps the array it had — a line without the old cursor,
+  // and an incoming line equal to the one already held — so its rendered row
+  // (a memoized TerminalLine) is not redone.
+  copy(current.lines, current.firstLine, incoming.isLatest, false);
+  copy(incoming.lines, incoming.firstLine, false, true);
 
   return {
     lines,
@@ -272,6 +309,57 @@ function mergeStyledContent(current: StyledContent | undefined, incoming: Styled
     terminalEnd: incoming.terminalEnd,
     isLatest: current.isLatest || incoming.isLatest,
   };
+}
+
+// Keep only a pane's most recent lines. Nothing earlier is lost for good:
+// scrolling to the top of what is kept pages older lines back in.
+function trimStyledContent(content: StyledContent, maxLines: number): StyledContent {
+  const excess = content.lines.length - maxLines;
+  if (excess <= 0) return content;
+  return { ...content, lines: content.lines.slice(excess), firstLine: content.firstLine + excess };
+}
+
+const KEY_NAMES: Record<string, string> = {
+  '\r': '⏎', '\n': '⇧⏎', '\t': 'Tab', '\x1b': 'Esc', '\x7f': '⌫', '\x1b[3~': 'Del',
+  '\x03': '^C', '\x04': '^D', '\x1a': '^Z', '\x0c': '^L', '\x15': '^U',
+  '\x1b[A': '↑', '\x1b[B': '↓', '\x1b[C': '→', '\x1b[D': '←',
+};
+
+// How a keystroke is named in a notice about it.
+function describeKeys(keys: string): string {
+  const named = KEY_NAMES[keys];
+  if (named) return named;
+  const text = keys.replace(/[\x00-\x1f\x7f]/g, ' ').trim();
+  return text.length > 40 ? `${text.slice(0, 40)}…` : text || 'keys';
+}
+
+function saveUnconfirmed(commands: string[]) {
+  try {
+    if (commands.length) localStorage.setItem(UNCONFIRMED_KEY, JSON.stringify(commands));
+    else localStorage.removeItem(UNCONFIRMED_KEY);
+  } catch {}
+}
+
+// Commands this page had sent but the server had not confirmed when it was
+// last unloaded (iOS evicting a background page does that without asking).
+function takeUnconfirmed(): string[] {
+  try {
+    const raw = localStorage.getItem(UNCONFIRMED_KEY);
+    localStorage.removeItem(UNCONFIRMED_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed.filter((c): c is string => typeof c === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
 }
 
 function loadHistory(): string[] {
@@ -375,6 +463,61 @@ export default function App() {
     split: { sessionId: string; content: StyledContent } | null;
   }>({ primary: null, split: null });
   const [selectionHold, setSelectionHold] = useState(false);
+  // Input on its way to iTerm2 (see inputQueue.ts), mirrored into state so
+  // the command bar can show what is still waiting.
+  const [pendingInputs, setPendingInputs] = useState<PendingInput[]>([]);
+  // When iTerm2 stopped answering, as the server reports it; null while it does.
+  const [itermStalledSince, setItermStalledSince] = useState<number | null>(null);
+  // A clock for the counters above, ticking only while one of them is shown.
+  const [clock, setClock] = useState(() => Date.now());
+  const [showRestartConfirm, setShowRestartConfirm] = useState(false);
+  const connectedRef = useRef(false);
+  const scrollLockedRef = useRef(scrollLocked);
+  useEffect(() => { scrollLockedRef.current = scrollLocked; }, [scrollLocked]);
+  const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (restartTimerRef.current) clearTimeout(restartTimerRef.current); }, []);
+  const restartRequestedRef = useRef(false);
+  const serverInstanceRef = useRef<string | null>(null);
+  // A pane just split from the phone, selected once a state that includes it
+  // arrives — the way iTerm focuses a new split on the Mac.
+  const pendingSplitRef = useRef<{ sessionId: string; pane: 'primary' | 'split' } | null>(null);
+
+  // Puts a command that did not make it back in the box, unless something
+  // else has been typed there since.
+  // Only a command for one pane: putting back a broadcast some panes took
+  // would invite sending it to them twice.
+  const restoreCommand = (input: PendingInput) => {
+    const text = input.payload.command;
+    if (input.event !== 'execute' || typeof text !== 'string' || !text) return;
+    setCommand(current => (current.trim() ? current : text));
+  };
+
+  const queueRef = useRef<InputQueue | null>(null);
+  if (queueRef.current === null) {
+    const queue = new InputQueue(PAGE_ID, {
+      isConnected: () => connectedRef.current,
+      emit: (event: InputKind, payload, onAck) => { socketRef.current?.emit(event, payload, onAck); },
+      reconnect: () => { socketRef.current?.io?.engine?.close(); },
+    }, {
+      changed: () => {
+        setPendingInputs(queue.pending.map(input => ({ ...input })));
+        saveUnconfirmed(queue.pending
+          .filter(input => input.event !== 'sendKeys' && input.state !== 'received')
+          .map(input => input.label));
+      },
+      failed: (input, reason) => {
+        setNotice(`Not delivered: ${input.label} — ${reason}`);
+        restoreCommand(input);
+      },
+      uncertain: (inputs) => {
+        setNotice(`The server restarted before iTerm2 confirmed: ${inputs.map(i => i.label).join(' · ')} — check the pane before sending again`);
+        const last = inputs[inputs.length - 1];
+        if (last) restoreCommand(last);
+      },
+    });
+    queueRef.current = queue;
+  }
+  const inputQueue = queueRef.current;
 
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => { winIdRef.current = selectedWinId; }, [selectedWinId]);
@@ -401,9 +544,35 @@ export default function App() {
 
   useEffect(() => {
     if (!notice) return;
-    const timer = setTimeout(() => setNotice(null), 4000);
+    const timer = setTimeout(() => setNotice(null), notice.length > 60 ? 9000 : 4000);
     return () => clearTimeout(timer);
   }, [notice]);
+
+  // A command this page sent but had no confirmation for when it was last
+  // unloaded: back in the box, never resent on its own.
+  useEffect(() => {
+    const unconfirmed = takeUnconfirmed();
+    if (!unconfirmed.length) return;
+    const last = unconfirmed[unconfirmed.length - 1];
+    setCommand(current => (current.trim() ? current : last));
+    setNotice(`Not confirmed before the page reloaded: ${unconfirmed.join(' · ')} — check the pane before sending again`);
+  }, []);
+
+  // Input still waiting, and iTerm2 stalls, are shown with how long they
+  // have lasted; the clock only ticks while either is on screen.
+  const hasPending = pendingInputs.length > 0;
+  useEffect(() => {
+    if (!hasPending && itermStalledSince === null) return;
+    const timer = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [hasPending, itermStalledSince]);
+
+  // A socket that swallows input without acknowledging it is dropped and
+  // reconnected; the queue decides when that has happened.
+  useEffect(() => {
+    const timer = setInterval(() => inputQueue.checkAcknowledgements(), 1000);
+    return () => clearInterval(timer);
+  }, [inputQueue]);
 
   // The reconnect banner waits out the brief gaps; the top-bar dot goes red
   // at once for anyone who wants to see them.
@@ -443,41 +612,117 @@ export default function App() {
     });
     socketRef.current = s;
 
+    // Input waits on each connection until the server says which process it
+    // is (`serverInfo`, sent as soon as it connects); a server too old to say
+    // is assumed after LEGACY_SERVER_WAIT_MS.
+    let legacyTimer: ReturnType<typeof setTimeout> | undefined;
     s.on('connect', () => {
+      connectedRef.current = true;
       setAuthError(false);
       setConnected(true);
       observeTransport(s);
       s.emit('hello', connectionHello());
+      inputQueue.connected();
+      clearTimeout(legacyTimer);
+      legacyTimer = setTimeout(() => inputQueue.serverInstance(LEGACY_SERVER), LEGACY_SERVER_WAIT_MS);
       void refreshKeyCookie(accessKey);
     });
     s.on('disconnect', (reason) => {
+      connectedRef.current = false;
       setConnected(false);
       rememberDisconnect(reason);
+      clearTimeout(legacyTimer);
+      // Socket.IO keeps what was emitted into a socket it had not yet noticed
+      // was dead, and sends it first thing on the next connection — ahead of
+      // older input the queue resends, which would put input out of order.
+      // The queue resends it all itself, in order; pings are simply redone.
+      if (Array.isArray(s.sendBuffer)) {
+        s.sendBuffer = s.sendBuffer.filter(packet =>
+          !(Array.isArray(packet.data) && typeof packet.data[0] === 'string' && UNBUFFERED_EVENTS.has(packet.data[0])));
+      }
+      inputQueue.disconnected();
     });
     s.on('connect_error', (error) => {
+      connectedRef.current = false;
       setConnected(false);
       if (error.message === 'invalid access key') {
         setAuthError(true);
         s.disconnect();
       }
     });
+    s.on('serverInfo', (info: unknown) => {
+      if (!isRecord(info) || typeof info.instance !== 'string') return;
+      const previous = serverInstanceRef.current;
+      serverInstanceRef.current = info.instance;
+      clearTimeout(legacyTimer);
+      inputQueue.serverInstance(info.instance);
+      if (restartRequestedRef.current && previous !== null && previous !== info.instance) {
+        restartRequestedRef.current = false;
+        setNotice('Server restarted');
+      }
+    });
+    s.on('inputDelivered', (data: unknown) => {
+      if (!isRecord(data) || data.page !== PAGE_ID || typeof data.upto !== 'number') return;
+      inputQueue.delivered(data.upto, parseFailures(data.failed));
+    });
+    s.on('itermStatus', (status: unknown) => {
+      if (!isRecord(status)) return;
+      if (status.ok !== false || typeof status.stalledSince !== 'number') {
+        setItermStalledSince(null);
+        return;
+      }
+      // Counted in this phone's clock: the Mac's may differ from it.
+      const serverNow = typeof status.now === 'number' ? status.now : status.stalledSince;
+      setItermStalledSince(Date.now() - Math.max(0, serverNow - status.stalledSince));
+    });
 
-    // Measure latency every 5s (+ immediately on connect)
+    // Latency every 5s (and at once on connect), and a liveness check: a
+    // ping still unanswered after PING_DEAD_MS means a dead socket, which is
+    // dropped so it reconnects now rather than after Engine.IO's 45s. Only
+    // time the page is visible counts — a suspended page answers nothing.
     let pingInterval: ReturnType<typeof setInterval>;
+    let pingSentAt: number | null = null;
+    let lastPingAt = 0;
     const doPing = () => {
-      const start = Date.now();
-      s.volatile.emit('ping', () => setLatency(Date.now() - start));
+      const now = Date.now();
+      if (pingSentAt !== null) {
+        if (now - pingSentAt > PING_DEAD_MS) {
+          pingSentAt = null;
+          s.io?.engine?.close();
+        }
+        return;
+      }
+      if (now - lastPingAt < 5000) return;
+      lastPingAt = now;
+      pingSentAt = now;
+      s.emit('ping', () => {
+        // Only this ping's answer clears it; a stale one says nothing now.
+        if (pingSentAt === now) pingSentAt = null;
+        setLatency(Date.now() - now);
+      });
     };
+    const forgetPing = () => {
+      if (document.visibilityState !== 'visible') return;
+      pingSentAt = null;
+      inputQueue.resumed();
+    };
+    document.addEventListener('visibilitychange', forgetPing);
     s.on('connect', () => {
+      pingSentAt = null;
+      lastPingAt = 0;
       doPing();
-      pingInterval = setInterval(doPing, 5000);
+      pingInterval = setInterval(doPing, 2000);
     });
     s.on('disconnect', () => clearInterval(pingInterval));
     s.on('screenSize', (size: ScreenSize) => setScreenSize(size));
 
     s.on('state', (newState: WindowState[]) => {
       setState(newState);
+      // Also here, synchronously: a split's acknowledgement may look for its
+      // new pane before the render that would update the ref.
+      stateRef.current = newState;
       if (newState.length === 0) return;
+      applyPendingSplit(newState);
 
       const frontWin = newState.find(w => w.isFront);
 
@@ -518,7 +763,7 @@ export default function App() {
 
     });
 
-    s.on('content', (data: { sessionId?: string } & StyledContent) => {
+    s.on('content', (data: { sessionId?: string; cached?: boolean } & StyledContent) => {
       const styled: StyledContent = {
         lines: data.lines,
         fg: data.fg,
@@ -529,7 +774,19 @@ export default function App() {
         isLatest: data.isLatest,
       };
       if (data.sessionId) {
-        const merged = mergeStyledContent(contentCacheRef.current.get(data.sessionId), styled);
+        // A frame the server held from earlier, sent to draw something at
+        // once: of no use to a page that already has this pane.
+        if (data.cached === true && contentCacheRef.current.has(data.sessionId)) return;
+        const full = mergeStyledContent(contentCacheRef.current.get(data.sessionId), styled);
+        // Not while someone is reading back through it, has it scroll-locked,
+        // or is waiting on an older page for it: dropping lines above them
+        // would move what they are reading, or orphan the page on its way.
+        const primary = data.sessionId === selectedSessionIdRef.current;
+        const split = data.sessionId === splitSessionIdRef.current;
+        const readingBack = (primary && (!primaryAtBottomRef.current || primaryHistoryLoadingRef.current))
+          || (split && (!splitAtBottomRef.current || splitHistoryLoadingRef.current))
+          || ((primary || split) && scrollLockedRef.current);
+        const merged = readingBack ? full : trimStyledContent(full, MAX_RETAINED_LINES);
         contentCacheRef.current.set(data.sessionId, merged);
         // Refresh the pane map's thumbnails while it's open (cached content for
         // non-viewed panes doesn't otherwise trigger a render).
@@ -553,7 +810,15 @@ export default function App() {
     });
 
     s.on('historyContent', (data: { sessionId: string } & StyledContent) => {
-      const merged = mergeStyledContent(contentCacheRef.current.get(data.sessionId), data);
+      const current = contentCacheRef.current.get(data.sessionId);
+      if (current && data.firstLine + data.lines.length < current.firstLine) {
+        // It no longer joins what is kept (live output moved on meanwhile);
+        // merged, it would replace everything. Scrolling up asks again.
+        if (data.sessionId === selectedSessionIdRef.current) primaryHistoryLoadingRef.current = false;
+        if (data.sessionId === splitSessionIdRef.current) splitHistoryLoadingRef.current = false;
+        return;
+      }
+      const merged = mergeStyledContent(current, data);
       contentCacheRef.current.set(data.sessionId, merged);
 
       if (data.sessionId === selectedSessionIdRef.current) {
@@ -574,8 +839,31 @@ export default function App() {
       }
     });
 
-    return () => { s.disconnect(); };
+    return () => {
+      clearInterval(pingInterval);
+      clearTimeout(legacyTimer);
+      document.removeEventListener('visibilitychange', forgetPing);
+      s.disconnect();
+    };
   }, [accessKey]);
+
+  // Select the pane a split from this page created, once a state has it.
+  // Only touches refs and setters, so the copy the state handler captured
+  // stays correct.
+  const applyPendingSplit = (snapshot: WindowState[]) => {
+    const split = pendingSplitRef.current;
+    if (!split) return;
+    const exists = snapshot.some(w => w.tabs.some(t => t.sessions.some(p => p.id === split.sessionId)));
+    if (!exists) return;
+    pendingSplitRef.current = null;
+    if (split.pane === 'split') {
+      setSplitSessionId(split.sessionId);
+      setSplitContent(contentCacheRef.current.get(split.sessionId) || null);
+    } else {
+      setSelectedSessionId(split.sessionId);
+      setContent(contentCacheRef.current.get(split.sessionId) || null);
+    }
+  };
 
   // Apply the pane a deep link asked for, against a complete state snapshot.
   // Returns true when the selection was taken over (the caller then skips its
@@ -770,8 +1058,18 @@ export default function App() {
   };
 
   // --- Handlers ---
+  // Everything typed goes through the input queue: sent now if connected,
+  // resent after a reconnect if the server never got it, never twice.
   const handleSend = () => {
-    if (!command.trim() || !socketRef.current) return;
+    if (!command.trim()) return;
+    const broadcasting = broadcastMode && broadcastTargets.size > 0;
+    const sessionId = getActiveSessionId();
+    if (!broadcasting && !sessionId) {
+      // Nothing to send it to yet (no state has arrived). The command stays
+      // in the box rather than going to whatever the Mac has in front.
+      setNotice('No pane to send to yet');
+      return;
+    }
     // Save to history
     const h = historyRef.current;
     if (h[h.length - 1] !== command.trim()) h.push(command.trim());
@@ -780,7 +1078,7 @@ export default function App() {
     savedCommandRef.current = '';
     setTypingLog(prev => appendTypingLog(prev, command.trim(), true));
 
-    if (broadcastMode && broadcastTargets.size > 0) {
+    if (broadcasting) {
       // Broadcast to all selected windows' active sessions
       const sessionIds: string[] = [];
       for (const winId of broadcastTargets) {
@@ -789,9 +1087,9 @@ export default function App() {
         const sid = tab?.sessions[0]?.id;
         if (sid) sessionIds.push(sid);
       }
-      socketRef.current.emit('broadcast', { command, sessionIds });
+      inputQueue.enqueue('broadcast', { command, sessionIds }, command.trim());
     } else {
-      socketRef.current.emit('execute', { sessionId: getActiveSessionId(), command });
+      inputQueue.enqueue('execute', { sessionId, command }, command.trim());
     }
     // Mark content as "about to change" for alert detection
     contentChangingRef.current = true;
@@ -837,7 +1135,6 @@ export default function App() {
         setSplitSessionId(sid);
         const cached = contentCacheRef.current.get(sid);
         if (cached) setSplitContent(cached);
-        socketRef.current?.emit('getContent', { sessionId: sid });
       }
     } else {
       setSelectedWinId(winId);
@@ -847,7 +1144,6 @@ export default function App() {
         setSelectedSessionId(sid);
         const cached = contentCacheRef.current.get(sid);
         if (cached) setContent(cached);
-        socketRef.current?.emit('getContent', { sessionId: sid });
       }
       socketRef.current?.emit('focus', { windowId: winId, tabIndex: tab.index });
     }
@@ -866,7 +1162,6 @@ export default function App() {
           setSplitSessionId(sid);
           const cached = contentCacheRef.current.get(sid);
           if (cached) setSplitContent(cached);
-          socketRef.current?.emit('getContent', { sessionId: sid });
         }
       }
     } else {
@@ -881,10 +1176,43 @@ export default function App() {
           setSelectedSessionId(sid);
           const cached = contentCacheRef.current.get(sid);
           if (cached) setContent(cached);
-          socketRef.current?.emit('getContent', { sessionId: sid });
         }
         socketRef.current?.emit('focus', { windowId: winId, tabIndex: tab.index });
       }
+    }
+  };
+
+  // The restart endpoint is served by the web client's own process, the one
+  // that loaded this page, so it answers even when the Python server is
+  // wedged or gone (client/server/restartEndpoint.ts).
+  const handleRestartServer = async () => {
+    setShowRestartConfirm(false);
+    try {
+      const response = await fetch(RESTART_URL, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(accessKey ? { key: accessKey } : {}),
+      });
+      if (response.status === 202) {
+        restartRequestedRef.current = true;
+        setNotice('Restarting the server — back in a few seconds');
+        if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+        restartTimerRef.current = setTimeout(() => {
+          if (!restartRequestedRef.current) return;
+          restartRequestedRef.current = false;
+          setNotice('The server has not come back yet — iTerm2 may not be answering; see .iterm-server.log on the Mac');
+        }, RESTART_WAIT_MS);
+        return;
+      }
+      let reason = `HTTP ${response.status}`;
+      try {
+        const body: unknown = await response.json();
+        if (isRecord(body) && typeof body.error === 'string') reason = body.error;
+      } catch {}
+      setNotice(`Restart refused: ${reason}`);
+    } catch {
+      setNotice('Could not reach the Mac to restart the server');
     }
   };
 
@@ -893,8 +1221,22 @@ export default function App() {
   // vertical=true divider (side-by-side panes) mirrors iTerm2's own Cmd+D
   // "Split Vertically"; vertical=false (stacked panes) mirrors Cmd+Shift+D
   // "Split Horizontally".
-  const handleSplitPane = (sessionId: string | undefined, vertical: boolean) =>
-    socketRef.current?.emit('splitPane', { sessionId, vertical });
+  //
+  // The server answers with the new pane, which is then selected in whichever
+  // view the split was made from.
+  const handleSplitPane = (sessionId: string | undefined, vertical: boolean, pane: 'primary' | 'split' = 'primary') => {
+    const s = socketRef.current;
+    if (!s || !sessionId) return;
+    s.emit('splitPane', { sessionId, vertical }, (ack: unknown) => {
+      if (!isRecord(ack)) return;
+      if (typeof ack.sessionId === 'string') {
+        pendingSplitRef.current = { sessionId: ack.sessionId, pane };
+        applyPendingSplit(stateRef.current);
+      } else if (typeof ack.error === 'string') {
+        setNotice(`Could not split: ${ack.error}`);
+      }
+    });
+  };
 
   const handleSplitWindowChange = (winId: string) => {
     setSplitWinId(winId);
@@ -907,7 +1249,6 @@ export default function App() {
       if (sid) {
         setSplitSessionId(sid);
         setSplitContent(contentCacheRef.current.get(sid) || null);
-        socketRef.current?.emit('getContent', { sessionId: sid });
       }
     }
     setFocusedPane('split');
@@ -920,7 +1261,6 @@ export default function App() {
       setSplitSessionId(sid);
       const cached = contentCacheRef.current.get(sid);
       if (cached) setSplitContent(cached);
-      socketRef.current?.emit('getContent', { sessionId: sid });
     }
     setFocusedPane('split');
   };
@@ -967,7 +1307,6 @@ export default function App() {
     setFocusedPane('primary');
     setShowPaneMap(false);
     setContent(contentCacheRef.current.get(sessionId) || null);
-    socketRef.current?.emit('getContent', { sessionId });
   };
 
   const longPressRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -981,7 +1320,12 @@ export default function App() {
   };
 
   const sendSpecialKey = (keys: string) => {
-    socketRef.current?.emit('sendKeys', { sessionId: getActiveSessionId(), keys });
+    const sessionId = getActiveSessionId();
+    if (!sessionId) {
+      setNotice('No pane to send to yet');
+      return;
+    }
+    inputQueue.enqueue('sendKeys', { sessionId, keys }, describeKeys(keys));
   };
 
   const toggleDirectInput = () => {
@@ -1060,7 +1404,7 @@ export default function App() {
     try {
       const text = await navigator.clipboard.readText();
       if (text) {
-        socketRef.current?.emit('sendKeys', { sessionId: getActiveSessionId(), keys: text });
+        sendSpecialKey(text);
         setTypingLog(prev => appendTypingLog(prev, text, true));
       }
     } catch {}
@@ -1114,6 +1458,10 @@ export default function App() {
       name: t.title || t.sessions[0]?.name || `Tab ${t.index}`,
     }))).filter(s => s.sessionId && s.sessionId !== activeSid);
   }, [state, activeWindow, selectedTabId]);
+
+  const oldestPending = pendingInputs.length ? Math.min(...pendingInputs.map(input => input.queuedAt)) : null;
+  const showPendingBadge = oldestPending !== null && clock - oldestPending >= PENDING_BADGE_DELAY_MS;
+  const itermStalled = itermStalledSince !== null;
 
   const handleAccessKeySubmit = (event: React.FormEvent) => {
     event.preventDefault();
@@ -1188,12 +1536,74 @@ export default function App() {
         </div>
       )}
 
+      {/* ── iTerm2 stall banner ── */}
+      {/* The server reports when iTerm2 stops answering its API (a Mac short
+          of memory has stalled it for over a minute). Said plainly, because
+          the alternative looks like a broken phone: output frozen and typing
+          apparently ignored. Typing is queued meanwhile, not lost. */}
+      {!authError && connected && itermStalled && (
+        <div
+          role="status"
+          className="fixed left-1/2 z-[100] flex -translate-x-1/2 items-center gap-2 rounded-full border border-amber-500/40 bg-zinc-900/95 px-4 py-1.5 text-[10px] font-bold tracking-[0.15em] text-amber-300 shadow-xl select-none pointer-events-none whitespace-nowrap"
+          style={{ top: 'calc(env(safe-area-inset-top, 0px) + 3.25rem)' }}
+        >
+          <TriangleAlert className="h-3.5 w-3.5 animate-pulse" />
+          ITERM2 NOT RESPONDING · {formatElapsed(clock - (itermStalledSince ?? clock))}
+          {pendingInputs.length > 0 && <span className="text-amber-400/70">· TYPING QUEUED</span>}
+        </div>
+      )}
+
       {notice && (
         <div
-          className="fixed left-1/2 z-[120] -translate-x-1/2 rounded-full border border-zinc-700 bg-zinc-900/95 px-4 py-2 text-[11px] text-zinc-300 shadow-xl select-none"
+          className="fixed left-1/2 z-[120] -translate-x-1/2 max-w-[92vw] rounded-2xl border border-zinc-700 bg-zinc-900/95 px-4 py-2 text-center text-[11px] text-zinc-300 shadow-xl select-none"
           style={{ top: 'calc(env(safe-area-inset-top, 0px) + 3.25rem)' }}
         >
           {notice}
+        </div>
+      )}
+
+      {/* ── Restart confirmation ── */}
+      {showRestartConfirm && (
+        <div
+          className="fixed inset-0 z-[105] flex items-center justify-center px-5 select-none"
+          onClick={() => setShowRestartConfirm(false)}
+          style={{ backgroundColor: 'rgba(0,0,0,0.85)', backdropFilter: 'blur(10px)', WebkitBackdropFilter: 'blur(10px)' }}
+        >
+          <div
+            role="dialog"
+            aria-label="Restart the server"
+            className="w-full max-w-sm rounded-xl border border-zinc-800 bg-[#111113] p-5 shadow-2xl"
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="mb-3 flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-lg border border-amber-500/30 bg-amber-500/10">
+                <RotateCw className="h-5 w-5 text-amber-400" />
+              </div>
+              <div className="text-[12px] font-bold tracking-[0.14em] text-zinc-200">RESTART THE SERVER?</div>
+            </div>
+            <p className="text-[11px] leading-relaxed text-zinc-400">
+              Phones reconnect within a few seconds and anything typed meanwhile is sent once it is back. Nothing running in iTerm2 is touched.
+            </p>
+            {itermStalled && (
+              <p className="mt-2 text-[11px] leading-relaxed text-amber-400/90">
+                iTerm2 itself is not answering right now. A restart will not fix that, and the server cannot come back until iTerm2 answers.
+              </p>
+            )}
+            <div className="mt-4 flex gap-2">
+              <button
+                onClick={() => setShowRestartConfirm(false)}
+                className="h-11 flex-1 rounded-lg border border-zinc-700 text-[11px] font-bold tracking-[0.14em] text-zinc-400 active:scale-95"
+              >
+                CANCEL
+              </button>
+              <button
+                onClick={() => { void handleRestartServer(); }}
+                className="h-11 flex-1 rounded-lg bg-amber-500 text-[11px] font-bold tracking-[0.14em] text-black active:scale-95"
+              >
+                RESTART
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -1228,6 +1638,20 @@ export default function App() {
           )}
         </div>
         <div className="flex items-center gap-1.5">
+          {/* Server restart */}
+          <button
+            onClick={() => setShowRestartConfirm(true)}
+            aria-label="Restart the server"
+            title="Restart the server"
+            className={`flex flex-col items-center gap-0.5 rounded-md border transition-all active:scale-95 ${isLandscape ? 'p-1' : 'p-1.5'}`}
+            style={{
+              color: itermStalled || !connected ? '#fbbf24' : '#52525b',
+              borderColor: '#3f3f46',
+              backgroundColor: 'transparent',
+            }}
+          >
+            <RotateCw className={isLandscape ? 'w-3 h-3' : 'w-3.5 h-3.5'} />
+          </button>
           {/* Alert toggle */}
           <button
             onClick={() => setAlertDone(!alertDone)}
@@ -1298,7 +1722,6 @@ export default function App() {
                 setSplitWinId(foundWin);
                 setSplitTabId(foundTab);
                 setSplitContent(contentCacheRef.current.get(sid) || null);
-                socketRef.current?.emit('getContent', { sessionId: sid });
               }
             }}
             aria-label="Show a second pane"
@@ -1431,7 +1854,7 @@ export default function App() {
       )}
 
       {/* ── Pane Layout Map (spatial pane switcher) ── */}
-      {showPaneMap && primaryPanes.length > 1 && (
+      {showPaneMap && primaryPanes.length > 0 && (
         <div
           className="fixed inset-0 z-[60] flex flex-col items-center justify-center select-none"
           onClick={() => setShowPaneMap(false)}
@@ -1528,7 +1951,40 @@ export default function App() {
               </>
             ) : (
               <>
-                <span className="text-[10px] text-zinc-600 tracking-wider">tap a pane · tap outside to close</span>
+                <span className="text-[10px] text-zinc-600 tracking-wider">
+                  {primaryPanes.length > 1 ? 'tap a pane · tap outside to close' : 'tap outside to close'}
+                </span>
+                {/* New panes from the phone: split the selected pane the way
+                    iTerm's own Split Vertically (side by side, ⌘D) and Split
+                    Horizontally (stacked, ⇧⌘D) do. The new pane is selected
+                    when it appears, and the map stays open to show it. */}
+                {selectedPaneNumber !== null && (
+                  <div className="flex flex-col items-center gap-1.5" role="group" aria-label={`Split pane ${selectedPaneNumber}`}>
+                    <span className="text-[9px] font-bold tracking-[0.18em] text-zinc-500">SPLIT PANE {selectedPaneNumber}</span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => handleSplitPane(selectedSessionId ?? undefined, true)}
+                        aria-label={`Split pane ${selectedPaneNumber} vertically`}
+                        title="Side by side (iTerm's Split Vertically)"
+                        className="flex items-center gap-1.5 px-4 h-9 rounded-lg border text-[10px] font-bold tracking-wider whitespace-nowrap active:scale-95 transition-all"
+                        style={{ borderColor: ACCENT + '40', backgroundColor: ACCENT + '12', color: ACCENT }}
+                      >
+                        <Columns2 className="w-3.5 h-3.5 flex-shrink-0" />
+                        VERTICAL
+                      </button>
+                      <button
+                        onClick={() => handleSplitPane(selectedSessionId ?? undefined, false)}
+                        aria-label={`Split pane ${selectedPaneNumber} horizontally`}
+                        title="Stacked (iTerm's Split Horizontally)"
+                        className="flex items-center gap-1.5 px-4 h-9 rounded-lg border text-[10px] font-bold tracking-wider whitespace-nowrap active:scale-95 transition-all"
+                        style={{ borderColor: ACCENT + '40', backgroundColor: ACCENT + '12', color: ACCENT }}
+                      >
+                        <Rows2 className="w-3.5 h-3.5 flex-shrink-0" />
+                        HORIZONTAL
+                      </button>
+                    </div>
+                  </div>
+                )}
                 {selectedPaneNumber !== null && (
                   <button
                     onClick={() => setPaneCloseArmed(true)}
@@ -1662,7 +2118,7 @@ export default function App() {
               : { flex: 1 }),
           }}
         >
-          {primaryPanes.length > 1 && (
+          {primaryPanes.length > 0 && (
             <PaneSwitcher
               panes={primaryPanes}
               selectedId={selectedSessionId}
@@ -1684,24 +2140,20 @@ export default function App() {
             {content && content.lines.length ? (
               <pre className="terminal-output p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full" style={{ color: content.fg, backgroundColor: content.bg }}>
                 {content.lines.map((runs, i) => (
-                  <span key={i}>
-                    {runs.map((r, j) => (
-                      r.c ? (
-                        focusedPane === 'primary' && (
-                          <span key={j} className="cursor-blink cursor-cell" style={{ color: ACCENT }} aria-hidden="true">█</span>
-                        )
-                      ) : (
-                        <TerminalRun key={j} run={r} />
-                      )
-                    ))}
-                    {i < content.lines.length - 1 ? '\n' : ''}
-                  </span>
+                  <TerminalLine
+                    key={content.firstLine + i}
+                    runs={runs}
+                    last={i === content.lines.length - 1}
+                    cursorColor={focusedPane === 'primary' ? ACCENT : null}
+                  />
                 ))}
               </pre>
             ) : (
               <div className="flex flex-col items-center justify-center h-full gap-3">
                 <Clock className="w-5 h-5 text-zinc-700 animate-pulse" />
-                <span className="text-[11px] text-zinc-700 tracking-wider">WAITING FOR OUTPUT</span>
+                <span className="text-[11px] text-zinc-700 tracking-wider">
+                  {connected && itermStalled ? 'WAITING FOR ITERM2 TO ANSWER' : 'WAITING FOR OUTPUT'}
+                </span>
               </div>
             )}
           </div>
@@ -1769,7 +2221,7 @@ export default function App() {
               <div className="flex items-center flex-shrink-0 ml-auto border-l border-zinc-800/60">
                 <span className="text-[10px] text-zinc-600 font-bold px-2 tabular-nums">{splitTabCount}</span>
                 <button
-                  onClick={(e) => { e.stopPropagation(); handleSplitPane(splitSessionId ?? undefined, true); }}
+                  onClick={(e) => { e.stopPropagation(); handleSplitPane(splitSessionId ?? undefined, true, 'split'); }}
                   className="flex items-center justify-center w-8 min-h-[30px] text-zinc-600 active:text-zinc-400 transition-colors"
                   aria-label="Split pane vertically"
                   title="Split vertically (side by side)"
@@ -1777,7 +2229,7 @@ export default function App() {
                   <Columns2 className="w-3.5 h-3.5" />
                 </button>
                 <button
-                  onClick={(e) => { e.stopPropagation(); handleSplitPane(splitSessionId ?? undefined, false); }}
+                  onClick={(e) => { e.stopPropagation(); handleSplitPane(splitSessionId ?? undefined, false, 'split'); }}
                   className="flex items-center justify-center w-8 min-h-[30px] text-zinc-600 active:text-zinc-400 transition-colors"
                   aria-label="Split pane horizontally"
                   title="Split horizontally (stacked)"
@@ -1827,18 +2279,12 @@ export default function App() {
               {splitContent && splitContent.lines.length ? (
                 <pre className="terminal-output p-4 text-[12px] leading-none whitespace-pre-wrap break-words min-h-full" style={{ color: splitContent.fg, backgroundColor: splitContent.bg }}>
                   {splitContent.lines.map((runs, i) => (
-                    <span key={i}>
-                      {runs.map((r, j) => (
-                        r.c ? (
-                          focusedPane === 'split' && (
-                            <span key={j} className="cursor-blink cursor-cell" style={{ color: '#38bdf8' }} aria-hidden="true">█</span>
-                          )
-                        ) : (
-                          <TerminalRun key={j} run={r} />
-                        )
-                      ))}
-                      {i < splitContent.lines.length - 1 ? '\n' : ''}
-                    </span>
+                    <TerminalLine
+                      key={splitContent.firstLine + i}
+                      runs={runs}
+                      last={i === splitContent.lines.length - 1}
+                      cursorColor={focusedPane === 'split' ? '#38bdf8' : null}
+                    />
                   ))}
                 </pre>
               ) : (
@@ -1988,6 +2434,17 @@ export default function App() {
               autoCorrect={!directInputMode && smartTyping ? 'on' : 'off'}
               spellCheck={!directInputMode && smartTyping}
             />
+            {showPendingBadge && (
+              <span
+                aria-live="polite"
+                aria-label={`${pendingInputs.length} waiting for iTerm2`}
+                title="Sent, waiting for iTerm2 to take it"
+                className="flex items-center gap-1 px-1 text-[10px] font-bold tabular-nums text-amber-400 flex-shrink-0 select-none"
+              >
+                <Hourglass className="w-3 h-3 animate-pulse" />
+                {pendingInputs.length}
+              </span>
+            )}
             {directInputMode ? (
               <span className="px-2 text-[9px] font-bold tracking-[0.16em] text-violet-400 flex-shrink-0">
                 LIVE
@@ -1995,7 +2452,10 @@ export default function App() {
             ) : (
               <button
                 onClick={handleSend}
-                disabled={!command.trim() || !connected}
+                aria-label="Send"
+                // Not disabled while disconnected: what is sent then waits and
+                // goes as soon as the connection is back.
+                disabled={!command.trim()}
                 className="w-10 h-10 flex items-center justify-center rounded-xl transition-all active:scale-90 disabled:opacity-20 flex-shrink-0"
                 style={{
                   backgroundColor: command.trim() ? (broadcastMode ? BROADCAST_COLOR : ACCENT) : '#27272a',
@@ -2170,6 +2630,33 @@ function TypingLogOverlay({ log, onClose }: { log: string; onClose: () => void }
   );
 }
 
+// --- One terminal line ---
+// Keyed by its absolute line number and memoized on its runs: a line that did
+// not change between frames keeps the same runs array (mergeStyledContent
+// keeps the one it had when an incoming line is equal to it), so a live frame
+// re-renders only the lines that did.
+const TerminalLine = memo(function TerminalLine({ runs, last, cursorColor }: {
+  runs: Run[];
+  last: boolean;
+  /** The cursor's colour, or null to hide it (its pane is not focused). */
+  cursorColor: string | null;
+}) {
+  return (
+    <span>
+      {runs.map((r, j) => (
+        r.c ? (
+          cursorColor !== null && (
+            <span key={j} className="cursor-blink cursor-cell" style={{ color: cursorColor }} aria-hidden="true">█</span>
+          )
+        ) : (
+          <TerminalRun key={j} run={r} />
+        )
+      ))}
+      {last ? '' : '\n'}
+    </span>
+  );
+});
+
 // --- One styled run of terminal text ---
 // A run carrying a link — an OSC 8 hyperlink, or a web address the server
 // recognised — is an anchor that opens in a new tab, with loopback hosts
@@ -2223,8 +2710,9 @@ const PanePreview = memo(function PanePreview({ content }: { content?: StyledCon
 });
 
 // --- Per-tab pane switcher ---
-// Shown only when the selected tab has more than one split pane; tapping a pane
-// makes it fill the primary view (and the client starts live-streaming it).
+// Shown for every tab, one pane or many: tapping a pane makes it fill the
+// primary view (and the client starts live-streaming it), and PANE opens the
+// map, which is also where a pane is split or closed.
 function PaneSwitcher({ panes, selectedId, onSelect, onOpenMap }: {
   panes: Session[];
   selectedId: string | null;

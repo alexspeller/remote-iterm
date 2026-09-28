@@ -24,6 +24,9 @@ class Line(iterm2.screen.LineContents):
 
     def __init__(self, proto):
         super().__init__(proto)
+        # Kept for exact comparison: two reads of a row are the same row, text
+        # and styles, exactly when their protos are equal.
+        self.proto = proto
         self._utf16 = proto.text.encode("utf-16-le")
         # _offsets[x] is the UTF-16 unit where cell x starts; one entry past
         # the last cell marks the end of the line.
@@ -58,8 +61,17 @@ class Line(iterm2.screen.LineContents):
         return out
 
 
-async def async_get_lines(session, first_line: int, count: int) -> list:
-    """``session.async_get_contents``, returning correctly-aligned ``Line``\\ s."""
+async def async_get_lines_and_cursor(
+        session, first_line: int, count: int) -> tuple[list, tuple[int, int]]:
+    """``count`` lines from absolute line ``first_line``, and the cursor.
+
+    iTerm2 puts the cursor in every buffer response, as (column, absolute
+    line) — the same numbering as ``first_line`` — so a caller that needs it
+    has no reason to fetch the screen a second time just to learn where it is.
+    That second fetch is not free: iTerm2 renders every API response as text
+    for its Script Console on its main thread, which for a styled screen is
+    ~200 KB of text per read.
+    """
     coord_range = iterm2.util.WindowedCoordRange(
         iterm2.util.CoordRange(
             iterm2.util.Point(0, first_line),
@@ -75,7 +87,14 @@ async def async_get_lines(session, first_line: int, count: int) -> list:
     if buffer.status != ok:
         raise iterm2.rpc.RPCException(
             iterm2.api_pb2.GetBufferResponse.Status.Name(buffer.status))
-    return [Line(proto) for proto in buffer.contents]
+    return ([Line(proto) for proto in buffer.contents],
+            (buffer.cursor.x, buffer.cursor.y))
+
+
+async def async_get_lines(session, first_line: int, count: int) -> list:
+    """``session.async_get_contents``, returning correctly-aligned ``Line``\\ s."""
+    lines, _cursor = await async_get_lines_and_cursor(session, first_line, count)
+    return lines
 
 
 def plain_text(line) -> str:

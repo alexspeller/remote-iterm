@@ -192,17 +192,6 @@ class _LineInfo:
         self.mutable_area_height = mutable_area_height
 
 
-class _CursorCoord:
-    def __init__(self, x=0, y=0):
-        self.x = x
-        self.y = y
-
-
-class _ScreenContents:
-    def __init__(self, x=0, y=0):
-        self.cursor_coord = _CursorCoord(x, y)
-
-
 class _FakeSession:
     """Minimal iterm2.Session double for read_content(). ``contents_gate``,
     if given, is awaited inside async_get_contents before returning — lets a
@@ -216,9 +205,6 @@ class _FakeSession:
     async def async_get_line_info(self):
         return _LineInfo(overflow=0, mutable_area_height=len(self._lines))
 
-    async def async_get_screen_contents(self):
-        return _ScreenContents(y=-1)  # cursor off the fetched range
-
     async def async_get_contents(self, first, count):
         if self._contents_gate is not None:
             await self._contents_gate.wait()
@@ -226,8 +212,9 @@ class _FakeSession:
 
 
 async def _fake_get_lines(session, first, count):
-    """Stands in for terminal_lines.async_get_lines, which reads over RPC."""
-    return await session.async_get_contents(first, count)
+    """Stands in for terminal_lines.async_get_lines_and_cursor, which reads
+    over RPC. The cursor sits off the fetched range."""
+    return await session.async_get_contents(first, count), (0, -1)
 
 
 class _FakeApp:
@@ -316,7 +303,7 @@ class ReadContentTransactionSafetyTest(unittest.IsolatedAsyncioTestCase):
     async def test_normal_read_never_opens_a_transaction(self):
         session = _FakeSession([_Line("hello")])
         with patch.object(server_module, "itermapp", _FakeApp(session)), \
-             patch.object(server_module, "async_get_lines", _fake_get_lines), \
+             patch.object(server_module, "async_get_lines_and_cursor", _fake_get_lines), \
              patch("iterm2.rpc.async_start_transaction",
                    side_effect=AssertionError("must not open a transaction")):
             result = await read_content("session-1")
@@ -328,7 +315,7 @@ class ReadContentTransactionSafetyTest(unittest.IsolatedAsyncioTestCase):
         gate = asyncio.Event()  # never set: async_get_contents blocks forever
         session = _FakeSession([_Line("hello")], contents_gate=gate)
         with patch.object(server_module, "itermapp", _FakeApp(session)), \
-             patch.object(server_module, "async_get_lines", _fake_get_lines), \
+             patch.object(server_module, "async_get_lines_and_cursor", _fake_get_lines), \
              patch("iterm2.rpc.async_start_transaction",
                    side_effect=AssertionError("must not open a transaction")):
             task = asyncio.create_task(read_content("session-1"))
@@ -351,7 +338,7 @@ class ReadContentLinksTest(unittest.IsolatedAsyncioTestCase):
             _Line("ng/path now"),
         ])
         with patch.object(server_module, "itermapp", _FakeApp(session)), \
-             patch.object(server_module, "async_get_lines", _fake_get_lines):
+             patch.object(server_module, "async_get_lines_and_cursor", _fake_get_lines):
             result = await read_content("session-1")
 
         url = "https://example.com/very/long/path"
@@ -515,7 +502,7 @@ class ConnectionWatchdogTest(unittest.IsolatedAsyncioTestCase):
         stop = asyncio.Event()
         probes = 0
 
-        async def stall_once(_connection):
+        async def stall_once():
             nonlocal probes
             probes += 1
             if probes == 1:
@@ -523,7 +510,7 @@ class ConnectionWatchdogTest(unittest.IsolatedAsyncioTestCase):
             return object()
 
         with self._live_connection(), \
-             patch("iterm2.rpc.async_list_sessions", side_effect=stall_once):
+             patch.object(server_module, "_probe_iterm", side_effect=stall_once):
             task = asyncio.create_task(
                 server_module.connection_watchdog(stop))
             await _spin_until(lambda: probes >= 5)
@@ -539,7 +526,7 @@ class ConnectionWatchdogTest(unittest.IsolatedAsyncioTestCase):
         stop = asyncio.Event()
         probes = 0
 
-        async def stall_every_other_probe(_connection):
+        async def stall_every_other_probe():
             nonlocal probes
             probes += 1
             if probes % 2:
@@ -547,8 +534,8 @@ class ConnectionWatchdogTest(unittest.IsolatedAsyncioTestCase):
             return object()
 
         with self._live_connection(), \
-             patch("iterm2.rpc.async_list_sessions",
-                   side_effect=stall_every_other_probe):
+             patch.object(server_module, "_probe_iterm",
+                          side_effect=stall_every_other_probe):
             task = asyncio.create_task(
                 server_module.connection_watchdog(stop))
             await _spin_until(
@@ -564,13 +551,13 @@ class ConnectionWatchdogTest(unittest.IsolatedAsyncioTestCase):
         stop = asyncio.Event()
         probes = 0
 
-        async def always_stalls(_connection):
+        async def always_stalls():
             nonlocal probes
             probes += 1
             raise asyncio.TimeoutError()
 
         with self._live_connection(), \
-             patch("iterm2.rpc.async_list_sessions", side_effect=always_stalls):
+             patch.object(server_module, "_probe_iterm", side_effect=always_stalls):
             await server_module.connection_watchdog(stop)
 
         self.assertTrue(stop.is_set())
@@ -581,7 +568,7 @@ class ConnectionWatchdogTest(unittest.IsolatedAsyncioTestCase):
         stop = asyncio.Event()
         probes = 0
 
-        async def fail(_connection):
+        async def fail():
             nonlocal probes
             probes += 1
             raise RuntimeError("boom")
@@ -589,7 +576,7 @@ class ConnectionWatchdogTest(unittest.IsolatedAsyncioTestCase):
         connection = _FakeConnection(closed=True)
         self.addCleanup(connection.cleanup)
         with patch.object(server_module, "connection", connection), \
-             patch("iterm2.rpc.async_list_sessions", side_effect=fail):
+             patch.object(server_module, "_probe_iterm", side_effect=fail):
             await server_module.connection_watchdog(stop)
 
         self.assertTrue(stop.is_set())
@@ -599,14 +586,14 @@ class ConnectionWatchdogTest(unittest.IsolatedAsyncioTestCase):
         stop = asyncio.Event()
         calls = 0
 
-        async def fake_list_sessions(_connection):
+        async def fake_probe():
             nonlocal calls
             calls += 1
             return object()
 
         with self._live_connection(), \
-             patch("iterm2.rpc.async_list_sessions",
-                   side_effect=fake_list_sessions):
+             patch.object(server_module, "_probe_iterm",
+                          side_effect=fake_probe):
             task = asyncio.create_task(
                 server_module.connection_watchdog(stop))
             await _spin_until(lambda: calls >= 1)

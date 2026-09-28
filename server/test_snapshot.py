@@ -382,8 +382,8 @@ class ConnectionWatchdogTest(unittest.IsolatedAsyncioTestCase):
                 raise asyncio.TimeoutError()
             return object()
 
-        with patch("iterm2.rpc.async_list_sessions",
-                   side_effect=stall_every_other_probe):
+        with patch.object(S, "_probe_iterm",
+                          side_effect=stall_every_other_probe):
             task = asyncio.create_task(
                 S.connection_watchdog(self._live_connection(), stop))
             for _ in range(20_000):
@@ -406,7 +406,7 @@ class ConnectionWatchdogTest(unittest.IsolatedAsyncioTestCase):
             probes += 1
             raise asyncio.TimeoutError()
 
-        with patch("iterm2.rpc.async_list_sessions", side_effect=always_stalls):
+        with patch.object(S, "_probe_iterm", side_effect=always_stalls):
             await S.connection_watchdog(self._live_connection(), stop)
 
         self.assertTrue(stop.is_set())
@@ -423,7 +423,7 @@ class ConnectionWatchdogTest(unittest.IsolatedAsyncioTestCase):
             probes += 1
             raise RuntimeError("boom")
 
-        with patch("iterm2.rpc.async_list_sessions", side_effect=fail):
+        with patch.object(S, "_probe_iterm", side_effect=fail):
             await S.connection_watchdog(connection, stop)
 
         self.assertTrue(stop.is_set())
@@ -433,13 +433,13 @@ class ConnectionWatchdogTest(unittest.IsolatedAsyncioTestCase):
         stop = asyncio.Event()
         calls = 0
 
-        async def fake_list_sessions(_connection):
+        async def fake_probe(_connection):
             nonlocal calls
             calls += 1
             return object()
 
-        with patch("iterm2.rpc.async_list_sessions",
-                   side_effect=fake_list_sessions):
+        with patch.object(S, "_probe_iterm",
+                          side_effect=fake_probe):
             task = asyncio.create_task(
                 S.connection_watchdog(self._live_connection(), stop))
             for _ in range(20_000):
@@ -491,6 +491,119 @@ class SnapshotterShutdownTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(ctx.exception.code, 0)
             finally:
                 loop.remove_signal_handler(signal.SIGINT)
+
+
+
+class _IdlePane:
+    """iterm2.Session double for the snapshotter's content reads. ``rows``
+    is the number of lines in its buffer; output appends to it. ``cursor``
+    is where its cursor is."""
+
+    def __init__(self, session_id="p:A", rows=30):
+        self.session_id = session_id
+        self.rows = rows
+        self.cursor = (0, 5)
+        self.grid_size = type("Size", (), {"width": 80, "height": 24})()
+        self.tail_reads = 0
+
+    async def async_get_line_info(self):
+        return type("Info", (), {"overflow": 0, "scrollback_buffer_height": self.rows - 24,
+                                 "mutable_area_height": 24})()
+
+
+class ContentReadTest(unittest.IsolatedAsyncioTestCase):
+    """Each tail read is hundreds of KB of work on iTerm2's main thread, so a
+    pane whose buffer has not moved is not read again."""
+
+    def setUp(self):
+        self.now = 1000.0
+        self.snapshotter = S.Snapshotter(connection=None, app=None)
+        self.pane = _IdlePane()
+
+        async def read_tail(_self, session, info, n=S.TAIL_LINES):
+            session.tail_reads += 1
+            if getattr(session, "fail_next", False):
+                session.fail_next = False
+                return None
+            return (f"tail at {session.rows}", "")
+
+        async def one_line(session, first, count):
+            return [], session.cursor
+
+        for entry in (patch.object(S, "async_get_lines_and_cursor", one_line),
+                      patch.object(S, "time", type("Clock", (), {"monotonic": staticmethod(lambda: self.now)})),
+                      patch.object(S.Snapshotter, "_read_tail", read_tail)):
+            entry.start()
+            self.addCleanup(entry.stop)
+
+    async def test_an_idle_pane_is_not_read_again(self):
+        await self.snapshotter._content_for(self.pane)
+        self.now += S.CONTENT_TTL_SECONDS + 1
+        texts = await self.snapshotter._content_for(self.pane)
+        self.assertEqual(self.pane.tail_reads, 1)
+        self.assertEqual(texts, ("tail at 30", ""))
+
+    async def test_a_pane_with_new_output_is_read_again(self):
+        await self.snapshotter._content_for(self.pane)
+        self.now += S.CONTENT_TTL_SECONDS + 1
+        self.pane.rows += 3
+        texts = await self.snapshotter._content_for(self.pane)
+        self.assertEqual(self.pane.tail_reads, 2)
+        self.assertEqual(texts, ("tail at 33", ""))
+
+    async def test_a_resized_pane_is_read_again(self):
+        await self.snapshotter._content_for(self.pane)
+        self.now += S.CONTENT_TTL_SECONDS + 1
+        self.pane.grid_size = type("Size", (), {"width": 100, "height": 24})()
+        await self.snapshotter._content_for(self.pane)
+        self.assertEqual(self.pane.tail_reads, 2)
+
+    async def test_even_an_idle_pane_is_read_again_eventually(self):
+        await self.snapshotter._content_for(self.pane)
+        self.now += S.CONTENT_MAX_AGE_SECONDS
+        await self.snapshotter._content_for(self.pane)
+        self.assertEqual(self.pane.tail_reads, 2)
+
+    async def test_output_on_a_screen_not_yet_full_is_noticed(self):
+        # A new pane or one just cleared: output moves the cursor down the
+        # screen without changing any line count.
+        await self.snapshotter._content_for(self.pane)
+        self.now += S.CONTENT_TTL_SECONDS + 1
+        self.pane.cursor = (0, 9)
+        await self.snapshotter._content_for(self.pane)
+        self.assertEqual(self.pane.tail_reads, 2)
+
+    async def test_a_failed_read_is_retried_rather_than_kept(self):
+        self.pane.fail_next = True
+        self.assertEqual(await self.snapshotter._content_for(self.pane), ("", ""))
+        self.now += S.CONTENT_TTL_SECONDS + 1
+        texts = await self.snapshotter._content_for(self.pane)
+        self.assertEqual(self.pane.tail_reads, 2)
+        self.assertEqual(texts, ("tail at 30", ""))
+
+    async def test_nothing_is_asked_of_iterm2_within_the_ttl(self):
+        await self.snapshotter._content_for(self.pane)
+        self.pane.async_get_line_info = AsyncMock(side_effect=AssertionError("asked"))
+        await self.snapshotter._content_for(self.pane)
+        self.assertEqual(self.pane.tail_reads, 1)
+
+
+class ForgetClosedTest(unittest.TestCase):
+    def test_caches_drop_panes_and_tabs_that_have_closed(self):
+        pane = type("Session", (), {"session_id": "open"})()
+        tab = type("Tab", (), {"tab_id": "t1", "all_sessions": [pane]})()
+        window = type("Window", (), {"tabs": [tab]})()
+        app = type("App", (), {"terminal_windows": [window]})()
+        snapshotter = S.Snapshotter(connection=None, app=app)
+        snapshotter.content_cache.update({"open": (0, (), ("", "")), "closed": (0, (), ("", ""))})
+        snapshotter.custom_dir_cache.update({"open": "", "closed": "/x"})
+        snapshotter.last_good.update({"t1": {}, "t-closed": {}})
+
+        snapshotter._forget_closed()
+
+        self.assertEqual(list(snapshotter.content_cache), ["open"])
+        self.assertEqual(list(snapshotter.custom_dir_cache), ["open"])
+        self.assertEqual(list(snapshotter.last_good), ["t1"])
 
 
 if __name__ == "__main__":

@@ -40,11 +40,13 @@ import iterm2.rpc
 try:
     from .ascii_layout import render as render_ascii
     from .geometry import pane_layout, serialize_tree
-    from .terminal_lines import ansi_text, async_get_lines, plain_text
+    from .terminal_lines import (
+        ansi_text, async_get_lines, async_get_lines_and_cursor, plain_text)
 except ImportError:  # Running directly from the server directory.
     from ascii_layout import render as render_ascii
     from geometry import pane_layout, serialize_tree
-    from terminal_lines import ansi_text, async_get_lines, plain_text
+    from terminal_lines import (
+        ansi_text, async_get_lines, async_get_lines_and_cursor, plain_text)
 
 SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "remote-iterm"
 SNAPSHOT_DIR = SUPPORT_DIR / "snapshots"
@@ -67,6 +69,14 @@ DEBOUNCE_SECONDS = 1.5       # coalesce a burst of change notifications
 MIN_INTERVAL_SECONDS = 10.0  # floor between successive snapshots
 HEARTBEAT_SECONDS = 30.0     # guarantee freshness + refresh content/cwd/job
 CONTENT_TTL_SECONDS = 30.0   # don't re-read a pane's content more often than this
+# A pane's tail is re-read only when its buffer has visibly moved — output
+# scrolled, the pane was resized or cleared — or when this much time has
+# passed regardless. Most panes are idle at any moment, and each tail read is
+# ~200 styled lines that iTerm2 renders as several hundred KB of text for its
+# Script Console on its main thread (see server/live_tail.py); checking for
+# movement costs one tiny line-count request instead. A program redrawing in
+# place without scrolling (a TUI's status line) is caught by the ceiling.
+CONTENT_MAX_AGE_SECONDS = 300.0
 ASCII_COLS = 60
 # Pause between panes while building a snapshot. A full build costs ~5 RPCs
 # per pane, and iTerm2 answers them on its main thread — so on a busy Mac
@@ -92,7 +102,8 @@ SNAPSHOT_TIMEOUT_SECONDS = 300.0
 WATCHDOG_INTERVAL = 15.0
 WATCHDOG_TIMEOUT = 20.0
 WATCHDOG_RETRY_INTERVAL = 3.0
-WATCHDOG_FAILURES_BEFORE_RESTART = 10
+# ~15 minutes of unbroken silence; see server.py for why it is this long.
+WATCHDOG_FAILURES_BEFORE_RESTART = 40
 
 
 def log(msg: str) -> None:
@@ -175,9 +186,8 @@ async def connection_watchdog(connection, stop: asyncio.Event) -> None:
     while not stop.is_set():
         started = time.monotonic()
         try:
-            await asyncio.wait_for(
-                iterm2.rpc.async_list_sessions(connection),
-                timeout=WATCHDOG_TIMEOUT)
+            await asyncio.wait_for(_probe_iterm(connection),
+                                   timeout=WATCHDOG_TIMEOUT)
         except asyncio.CancelledError:
             raise
         except Exception as err:
@@ -206,6 +216,32 @@ async def connection_watchdog(connection, stop: asyncio.Event) -> None:
             await asyncio.wait_for(stop.wait(), timeout=delay)
         except asyncio.TimeoutError:
             pass
+
+
+async def _probe_iterm(connection) -> None:
+    """One app variable: the cheapest round trip iTerm2 offers. The probe
+    used to be a full session listing, which iTerm2 renders as ~22 KB of text
+    for its Script Console every time (see server/live_tail.py)."""
+    await iterm2.rpc.async_variable(connection, gets=["pid"])
+
+
+async def _cursor(session, info) -> tuple[int, int] | None:
+    """Where the pane's cursor is, from a one-line read. Output on a screen
+    not yet full moves the cursor without changing any line count."""
+    end = info.overflow + info.scrollback_buffer_height + info.mutable_area_height
+    if end <= info.overflow:
+        return None
+    _lines, cursor = await async_get_lines_and_cursor(session, end - 1, 1)
+    return cursor
+
+
+def _buffer_shape(session, info) -> tuple:
+    """What changes when a pane's buffer moves: its line counts, and its size
+    (a width change reflows every line)."""
+    size = getattr(session, "grid_size", None)
+    return (info.overflow, info.scrollback_buffer_height,
+            info.mutable_area_height,
+            getattr(size, "width", None), getattr(size, "height", None))
 
 
 def tail_texts(lines) -> tuple[str, str]:
@@ -245,9 +281,10 @@ class Snapshotter:
         # tab_id -> {"rects", "aspect", "tree"} last captured while NOT maximized,
         # so a currently-maximized tab still renders/restores its real layout.
         self.last_good: dict[str, dict] = {}
-        # session_id -> (monotonic_ts, (plain, styled)) so rapid triggers don't
-        # re-read all panes; the heartbeat keeps them fresh.
-        self.content_cache: dict[str, tuple[float, tuple[str, str]]] = {}
+        # session_id -> (monotonic_ts of the read, buffer shape then,
+        # (plain, styled)) so rapid triggers don't re-read all panes, and an
+        # idle pane is not re-read at all until CONTENT_MAX_AGE_SECONDS.
+        self.content_cache: dict[str, tuple[float, tuple, tuple[str, str]]] = {}
         # session_id -> profile custom initial directory ("" if not custom). Read
         # once; a profile's working-directory setting doesn't change per session.
         self.custom_dir_cache: dict[str, str] = {}
@@ -255,8 +292,10 @@ class Snapshotter:
 
     # --- content -----------------------------------------------------------
 
-    async def _read_tail(self, session, n: int = TAIL_LINES) -> tuple[str, str]:
-        """The pane's last ``n`` lines as (plain text, text with ANSI colour)."""
+    async def _read_tail(self, session, info,
+                         n: int = TAIL_LINES) -> tuple[str, str] | None:
+        """The pane's last ``n`` lines as (plain text, text with ANSI colour),
+        given its line info; None if they could not be read."""
         try:
             # Not wrapped in an iterm2.Transaction: a transaction blocks
             # iTerm2's entire main thread until explicitly ended, and this
@@ -266,7 +305,6 @@ class Snapshotter:
             # async_get_contents already tolerates the screen changing
             # between these two calls by returning fewer lines than
             # requested rather than raising.
-            info = await session.async_get_line_info()
             available_first = info.overflow
             terminal_end = (available_first + info.scrollback_buffer_height
                             + info.mutable_area_height)
@@ -278,15 +316,29 @@ class Snapshotter:
             return tail_texts(lines)
         except Exception as err:
             log(f"content read failed for {session.session_id}: {err}")
-            return "", ""
+            return None
 
     async def _content_for(self, session) -> tuple[str, str]:
         now = time.monotonic()
         cached = self.content_cache.get(session.session_id)
         if cached is not None and now - cached[0] < CONTENT_TTL_SECONDS:
-            return cached[1]
-        texts = await self._read_tail(session)
-        self.content_cache[session.session_id] = (now, texts)
+            return cached[2]
+        try:
+            info = await session.async_get_line_info()
+            cursor = await _cursor(session, info)
+        except Exception as err:
+            log(f"content read failed for {session.session_id}: {err}")
+            return cached[2] if cached is not None else ("", "")
+        shape = _buffer_shape(session, info) + (cursor,)
+        if (cached is not None and cached[1] == shape
+                and now - cached[0] < CONTENT_MAX_AGE_SECONDS):
+            return cached[2]
+        texts = await self._read_tail(session, info)
+        if texts is None:
+            # Not cached: a failed read is retried next time, not kept for
+            # CONTENT_MAX_AGE_SECONDS as if the pane were blank.
+            return cached[2] if cached is not None else ("", "")
+        self.content_cache[session.session_id] = (now, shape, texts)
         return texts
 
     async def _custom_dir(self, session) -> str:
@@ -425,11 +477,25 @@ class Snapshotter:
                 "bounds": bounds,
                 "tabs": tabs,
             })
+        self._forget_closed()
         return {
             "version": SNAPSHOT_VERSION,
             "capturedAt": datetime.now(timezone.utc).isoformat(),
             "windows": windows,
         }
+
+    def _forget_closed(self) -> None:
+        """Drop what is cached for panes and tabs that no longer exist, which
+        otherwise accumulates for every pane opened while this process runs
+        (each content entry holds a TAIL_LINES tail)."""
+        tabs = [tab for window in self.app.terminal_windows for tab in window.tabs]
+        live_tabs = {tab.tab_id for tab in tabs}
+        live_sessions = {s.session_id for tab in tabs for s in tab.all_sessions}
+        for cache, live in ((self.content_cache, live_sessions),
+                            (self.custom_dir_cache, live_sessions),
+                            (self.last_good, live_tabs)):
+            for key in [k for k in cache if k not in live]:
+                del cache[key]
 
     # --- writing -----------------------------------------------------------
 

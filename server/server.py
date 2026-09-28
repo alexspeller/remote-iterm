@@ -19,6 +19,8 @@ import resource
 import signal
 import sys
 import time
+import uuid
+from collections import OrderedDict
 from datetime import datetime
 
 import iterm2
@@ -37,7 +39,8 @@ try:
         load_or_create_key,
     )
     from .geometry import pane_layout
-    from .terminal_lines import async_get_lines
+    from .live_tail import LiveTail, TailFrame
+    from .terminal_lines import async_get_lines_and_cursor
 except ImportError:  # Running server.py directly from the server directory.
     from auth import (
         COOKIE_MAX_AGE,
@@ -48,7 +51,8 @@ except ImportError:  # Running server.py directly from the server directory.
         load_or_create_key,
     )
     from geometry import pane_layout
-    from terminal_lines import async_get_lines
+    from live_tail import LiveTail, TailFrame
+    from terminal_lines import async_get_lines_and_cursor
 
 PORT = 7291
 
@@ -66,13 +70,37 @@ PREVIEW_CONTENT_LINES = 40
 # usefully render 20 frames/second of terminal text anyway, and the cost is
 # at most one extra STREAM_MIN_INTERVAL of latency after a keystroke.
 STREAM_MIN_INTERVAL = 0.15
+# A read that took iTerm2 a while says its main thread is loaded, so the next
+# one waits in proportion (twice the read's duration), up to this ceiling.
+# The alternative — reading again at full rate — adds to the very queue the
+# phone's keystrokes are waiting in.
+STREAM_MAX_INTERVAL = 2.0
 MAX_SOCKET_QUEUE_DEPTH = 2
 MAX_WATCHED_SESSIONS = 2
 
+# The last frame read for recently viewed panes, so a phone that reconnects
+# or reloads draws something at once instead of WAITING FOR OUTPUT until
+# iTerm2 answers — which, on a Mac short of memory, has taken over a minute.
+# Bounded by count and pruned of closed panes on every state push.
+CONTENT_CACHE_SIZE = 48
+
+# How often window/tab state is re-read for changes no notification reports
+# (tab titles). Only a phone looks at those live; other clients (aveiro keeps
+# one connected permanently) get the slower rate, so an idle Mac is not
+# re-read every two seconds around the clock.
+SYNC_INTERVAL_BROWSER = 2.0
+SYNC_INTERVAL_BACKGROUND = 10.0
+
 # How often the watchdog proves the iTerm2 connection is actually answering
-# RPCs (not just open), and how long it waits for one round trip.
+# RPCs (not just open), and how long it waits for one round trip. While a
+# phone is connected it probes more often, since the same probe is what tells
+# the phone that iTerm2 has stopped answering.
 WATCHDOG_INTERVAL = 15.0
+WATCHDOG_INTERVAL_BROWSER = 3.0
 WATCHDOG_TIMEOUT = 20.0
+# A probe still unanswered after this long marks iTerm2 as stalled for the
+# phones, which say so rather than looking broken.
+STALL_AFTER = 3.0
 # How long to wait before re-probing after a failed probe (rather than the
 # full WATCHDOG_INTERVAL), so a connection that really is dead in a way we
 # can't detect directly is still declared dead within ~90s.
@@ -86,15 +114,30 @@ WATCHDOG_RETRY_INTERVAL = 3.0
 # which dropped every phone client and — because the restart re-read every
 # pane — provoked the next stall.
 #
-# Deliberately patient (~4 minutes of unbroken silence at these intervals),
+# Deliberately patient (~15 minutes of unbroken silence at these intervals),
 # because this path has almost nothing left to catch. iTerm2 3.3.12+ serves
 # the API over a unix domain socket, which cannot go half-open: if iTerm2
 # exits or closes it, the read loop gets EOF at once and
 # _iterm_connection_dead reports it on the very first failed probe. Only the
 # legacy TCP transport can hang silently, so waiting longer costs nothing
-# real and a false restart costs every connected phone.
-WATCHDOG_FAILURES_BEFORE_RESTART = 10
+# real and a false restart costs every connected phone. It was ~4 minutes
+# until a Mac short of memory stalled iTerm2 for 158s on 2026-09-28: a
+# restart during a stall cannot help (the new server cannot connect until
+# iTerm2 answers either), and each one leaves its Script Console entry in
+# iTerm2's memory for good (see docs/ARCHITECTURE.md, "Why iTerm2 stalls").
+WATCHDOG_FAILURES_BEFORE_RESTART = 40
 SHUTDOWN_TIMEOUT = 10.0
+
+# Identifies this process to clients. A page holding input the previous
+# process acknowledged but had not yet handed to iTerm2 cannot know whether
+# it arrived, and must not send it twice; seeing a new instance is how it
+# learns to ask the user instead.
+SERVER_INSTANCE = uuid.uuid4().hex[:12]
+
+# Input streams for pages that have gone quiet are dropped after this long,
+# keeping only the last sequence number each delivered (see InputStream).
+INPUT_STREAM_IDLE_SECONDS = 1800.0
+MAX_INPUT_PAGES = 500
 
 # Coroutine qualnames whose death means "the iTerm2 connection is broken",
 # not "an isolated per-client/per-session bug" (those already contain their
@@ -186,6 +229,23 @@ delivery_tasks: dict[str, asyncio.Task] = {}
 # Per-session color palette (default fg/bg + ANSI 0-15), read once from the
 # session's iTerm2 profile so standard colors match the user's actual theme.
 palette_cache: dict[str, dict] = {}
+
+# Most recent live frame per pane, least recently used first; see
+# CONTENT_CACHE_SIZE.
+content_cache: "OrderedDict[str, dict]" = OrderedDict()
+
+# Clients that introduced themselves with `hello` — browser pages, as
+# opposed to programmatic clients — and the page each connection belongs to.
+browser_clients: set[str] = set()
+# The connection each page most recently introduced itself on. Delivery
+# reports for a page go there, not to whichever connection last carried its
+# input: a late packet on a half-dead old connection must not divert them.
+sid_by_page: dict[str, str] = {}
+
+# Whether iTerm2 is answering, as the watchdog last saw it. `stalledSince` is
+# a wall-clock epoch in milliseconds, so a client can count the stall up
+# itself without being sent a tick every second.
+iterm_status: dict = {"ok": True, "stalledSince": None, "latencyMs": None}
 
 
 # --- Screen geometry (CoreGraphics, no AppKit/osascript) -----------------------
@@ -295,6 +355,10 @@ async def build_state() -> list:
 
 
 _last_pushed_state: str | None = None
+# The same state as built, handed to a newly connected client at once rather
+# than after the dozen RPCs a fresh build costs — which during an iTerm2
+# stall is as long as the stall. A fresh build follows it regardless.
+_last_state: list | None = None
 
 # Set by the iTerm2 notification monitors instead of having each notification
 # rebuild state inline. build_state() costs one RPC per window plus one per
@@ -370,16 +434,35 @@ def queue_content_for_watchers(session_id: str, content: dict) -> None:
                 sid, f"content:{session_id}", "content", data)
 
 
-async def push_state() -> None:
-    """Broadcast window/tab state, skipping the emit when nothing changed."""
-    global _last_pushed_state
+def _state_session_ids(state: list) -> set[str]:
+    return {session["id"]
+            for window in state for tab in window["tabs"]
+            for session in tab["sessions"]}
+
+
+def _forget_closed_panes(live_ids: set[str]) -> None:
+    """Drop per-pane caches for panes that no longer exist. Without this they
+    grow with every pane ever opened for as long as the server runs."""
+    for cache in (palette_cache, content_cache, _read_failure_logged):
+        for session_id in [s for s in cache if s not in live_ids]:
+            del cache[session_id]
+
+
+async def push_state(new_client: str | None = None) -> None:
+    """Broadcast window/tab state, skipping the emit when nothing changed —
+    except to ``new_client``, which gets it regardless."""
+    global _last_pushed_state, _last_state
     if not clients:
         return
     state = await build_state()
     serialized = json.dumps(state, sort_keys=True)
     if serialized == _last_pushed_state:
+        if new_client is not None:
+            queue_client_event(new_client, "state", "state", state)
         return
     _last_pushed_state = serialized
+    _last_state = state
+    _forget_closed_panes(_state_session_ids(state))
     for sid in list(clients):
         queue_client_event(sid, "state", "state", state)
 
@@ -392,26 +475,44 @@ async def sync_loop() -> None:
     per-call subprocesses the way the old AppleScript server did.
     """
     while True:
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(SYNC_INTERVAL_BROWSER if browser_clients
+                            else SYNC_INTERVAL_BACKGROUND)
         if clients:
             await push_state()
 
 
 async def health_loop() -> None:
-    """Periodic bounded-queue and peak-RSS telemetry for leak diagnosis."""
+    """Periodic bounded-queue and peak-RSS telemetry for leak diagnosis.
+
+    `lines_read` is how many terminal lines live streams fetched from iTerm2
+    in the last minute — the load the phone puts on iTerm2's main thread.
+    """
+    lines_before = stream_lines_read
     while True:
         await asyncio.sleep(60)
+        try:
+            await evict_idle_input_streams()
+        except Exception as err:
+            log(f"input stream eviction failed: {err!r}")
         queue_depths = [
             depth for sid in clients
             if (depth := _socket_queue_depth(sid)) is not None
         ]
         max_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         max_rss_mb = max_rss / (1024 * 1024 if sys.platform == "darwin" else 1024)
+        lines_read = stream_lines_read - lines_before
+        lines_before = stream_lines_read
+        iterm = ("ok" if iterm_status["ok"]
+                 else f"stalled {int(time.time() - iterm_status['stalledSince'] / 1000)}s")
         log(
             "health: "
             f"max_rss={max_rss_mb:.1f}MB clients={len(clients)} "
-            f"streams={len(stream_tasks)} pending={sum(map(len, pending_events.values()))} "
-            f"engineio_queue_max={max(queue_depths, default=0)}")
+            f"browsers={len(browser_clients)} "
+            f"streams={len(stream_tasks)} retiring={len(_retiring_streams)} "
+            f"pending={sum(map(len, pending_events.values()))} "
+            f"engineio_queue_max={max(queue_depths, default=0)} "
+            f"lines_read={lines_read} cached={len(content_cache)} "
+            f"inputs={len(input_streams)} iterm={iterm}")
 
 
 # --- Reading terminal contents with faithful colors ---------------------------
@@ -672,11 +773,27 @@ def _content_line_range(
     return first, page_end - first, available_first, terminal_end
 
 
+def render_frame(frame: TailFrame, pal: dict, *, is_latest: bool) -> dict:
+    """The styled, linked content a client draws, from lines read from iTerm2."""
+    cursor_x, cursor_y = frame.cursor
+    rendered = [
+        _line_runs(line, pal,
+                   cursor_x if frame.first + i == cursor_y else None)
+        for i, line in enumerate(frame.lines)
+    ]
+    _autolink(rendered, frame.lines)
+    return {
+        "lines": rendered, "fg": pal["fg"], "bg": pal["bg"],
+        "firstLine": frame.first, "availableFirstLine": frame.available_first,
+        "terminalEnd": frame.terminal_end,
+        "isLatest": is_latest,
+    }
+
+
 async def read_content(
         session_id: str | None,
         line_count: int = LIVE_CONTENT_LINES,
         before_line: int | None = None,
-        screen=None,
 ) -> dict | None:
     if itermapp is None or not session_id or session_id == "undefined":
         return None
@@ -696,8 +813,6 @@ async def read_content(
         # race here just yields a slightly short frame that the next stream
         # tick (at most STREAM_MIN_INTERVAL later) corrects.
         info = await session.async_get_line_info()
-        if screen is None:
-            screen = await session.async_get_screen_contents()
         first, count, available_first, terminal_end = _content_line_range(
             info, line_count, before_line)
         if count <= 0:
@@ -710,21 +825,33 @@ async def read_content(
         # Not session.async_get_contents: its per-cell text shifts by one
         # after every emoji outside the Basic Multilingual Plane (see
         # terminal_lines), which misaligns colours and drops the line's end.
-        lines = await async_get_lines(session, first, count)
-        cursor = screen.cursor_coord
-        rendered = [
-            _line_runs(line, pal, cursor.x if first + i == cursor.y else None)
-            for i, line in enumerate(lines)
-        ]
-        _autolink(rendered, lines)
-        return {
-            "lines": rendered, "fg": pal["fg"], "bg": pal["bg"],
-            "firstLine": first, "availableFirstLine": available_first,
-            "terminalEnd": terminal_end,
-            "isLatest": before_line is None,
-        }
+        # The cursor comes back in the same response.
+        lines, cursor = await async_get_lines_and_cursor(session, first, count)
+        content = render_frame(
+            TailFrame(first=first, lines=lines, cursor=cursor,
+                      available_first=available_first,
+                      terminal_end=terminal_end),
+            pal, is_latest=before_line is None)
+        if before_line is None and line_count >= LIVE_CONTENT_LINES:
+            remember_content(session_id, content)
+        return content
     except Exception:
         return None
+
+
+def remember_content(session_id: str, content: dict) -> None:
+    """Keep a pane's latest live frame for the next client that asks for it."""
+    if not content.get("lines"):
+        return
+    content_cache[session_id] = content
+    content_cache.move_to_end(session_id)
+    while len(content_cache) > CONTENT_CACHE_SIZE:
+        content_cache.popitem(last=False)
+
+
+def cached_content(session_id: str) -> dict | None:
+    """The freshest frame this server holds for a pane, without asking iTerm2."""
+    return last_content.get(session_id) or content_cache.get(session_id)
 
 
 # --- Active-session selection helpers ------------------------------------------
@@ -743,10 +870,14 @@ def current_active_session_id() -> str | None:
 
 
 def resolve_session(session_id: str | None) -> iterm2.Session | None:
+    """The pane a request names, or iTerm's focused pane if it names none.
+
+    A named pane that no longer exists resolves to nothing. It used to fall
+    back to the focused pane too, which typed a stale request's keystrokes
+    into whatever the Mac happened to have in front.
+    """
     if itermapp is not None and session_id and session_id != "undefined":
-        session = itermapp.get_session_by_id(session_id)
-        if session is not None:
-            return session
+        return itermapp.get_session_by_id(session_id)
     return current_session()
 
 
@@ -757,57 +888,108 @@ def resolve_session(session_id: str | None) -> iterm2.Session | None:
 # every change. This is decoupled from iTerm's own focus, so the phone can watch
 # any pane — including a background split pane — and still get live updates.
 
+# Lines fetched from iTerm2 by live streams since start, for the health log:
+# the measure of how much work the phone is asking of iTerm2.
+stream_lines_read = 0
+
+
+_read_failure_logged: dict[str, float] = {}
+
+
+async def _read_live_frame(session_id: str, session, tail: LiveTail) -> dict | None:
+    global stream_lines_read
+    try:
+        pal = await get_palette(session)
+        before = tail.lines_read
+        frame = await tail.read(session)
+        stream_lines_read += tail.lines_read - before
+        return render_frame(frame, pal, is_latest=True)
+    except asyncio.CancelledError:
+        raise
+    except Exception as err:
+        now = time.monotonic()
+        if now - _read_failure_logged.get(session_id, -60.0) >= 60.0:
+            _read_failure_logged[session_id] = now
+            log(f"live read failed ({session_id}): {err!r}")
+        return None
+
+
+def _publish_frame(session_id: str, content: dict) -> None:
+    last_content[session_id] = content
+    remember_content(session_id, content)
+    queue_content_for_watchers(session_id, content)
+
+
 async def stream_session(session_id: str) -> None:
     session = itermapp.get_session_by_id(session_id) if itermapp else None
     if session is None:
         return
-
-    content = await read_content(session_id)
-    if content is not None and content["lines"] and clients:
-        last_content[session_id] = content
-        queue_content_for_watchers(session_id, content)
+    tail = LiveTail(LIVE_CONTENT_LINES)
 
     try:
+        content = await _read_live_frame(session_id, session, tail)
+        if content is not None and content["lines"] and clients:
+            _publish_frame(session_id, content)
+
         # The notification itself is enough: waiting briefly before fetching the
         # current screen coalesces bursts of changes and avoids allocating a
         # stale screen snapshot for every byte of fast terminal output.
+        pause = STREAM_MIN_INTERVAL
         async with session.get_screen_streamer(want_contents=False) as streamer:
             while True:
                 await streamer.async_get()
-                await asyncio.sleep(STREAM_MIN_INTERVAL)
+                await asyncio.sleep(pause)
                 if not clients:
                     continue
-                content = await read_content(session_id)
+                started = time.monotonic()
+                content = await _read_live_frame(session_id, session, tail)
+                pause = min(STREAM_MAX_INTERVAL,
+                            max(STREAM_MIN_INTERVAL,
+                                2 * (time.monotonic() - started)))
                 if content is not None and content != last_content.get(session_id):
-                    last_content[session_id] = content
-                    queue_content_for_watchers(session_id, content)
+                    _publish_frame(session_id, content)
     except asyncio.CancelledError:
         raise
     except Exception as err:
         log(f"stream error ({session_id}): {err}")
     finally:
-        last_content.pop(session_id, None)
+        # A stream being torn down can still be finishing (its unsubscribe
+        # waits on iTerm2) after a new stream for the same pane has started;
+        # the frame it would drop is then the new stream's.
+        if stream_tasks.get(session_id) in (None, asyncio.current_task()):
+            last_content.pop(session_id, None)
+
+
+# Cancelled streams still finishing their teardown. Their unsubscribe is an
+# RPC like any other, so during an iTerm2 stall it takes as long as the stall;
+# they finish in the background rather than holding up the next reconcile.
+_retiring_streams: set[asyncio.Task] = set()
+
+
+def _retire(task: asyncio.Task) -> None:
+    task.cancel()
+    _retiring_streams.add(task)
+    task.add_done_callback(_retiring_streams.discard)
 
 
 async def apply_watches() -> None:
-    """Reconcile running stream tasks with the union of watched sessions."""
+    """Reconcile running stream tasks with the union of watched sessions.
+
+    Never waits for a cancelled stream to finish: that wait used to happen
+    under the lock, so while iTerm2 was stalled one client switching panes
+    held up every other client's `watch` until iTerm2 answered.
+    """
     async with stream_reconcile_lock:
         union: set[str] = set()
         for ids in watched_by_sid.values():
             union |= ids
 
-        finished = []
         for session_id, task in list(stream_tasks.items()):
             if session_id not in union:
-                task.cancel()
-                finished.append(task)
                 stream_tasks.pop(session_id, None)
+                _retire(task)
             elif task.done():
-                finished.append(task)
                 stream_tasks.pop(session_id, None)  # restart below if wanted
-
-        if finished:
-            await asyncio.gather(*finished, return_exceptions=True)
 
         if clients:
             for session_id in union:
@@ -821,9 +1003,7 @@ async def stop_all_streams() -> None:
         tasks = list(stream_tasks.values())
         stream_tasks.clear()
         for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            _retire(task)
 
 
 # --- iTerm2 notification monitors (replace the old poll loops) -----------------
@@ -918,11 +1098,18 @@ async def connection_watchdog(stop: asyncio.Event) -> None:
     failures = 0
     while not stop.is_set():
         started = time.monotonic()
+        stalled_since_ms = int(time.time() * 1000)
+        probe = asyncio.ensure_future(_probe_iterm())
         try:
-            await asyncio.wait_for(
-                iterm2.rpc.async_list_sessions(connection),
-                timeout=WATCHDOG_TIMEOUT)
+            try:
+                await asyncio.wait_for(asyncio.shield(probe), timeout=STALL_AFTER)
+            except asyncio.TimeoutError:
+                if probe.done():
+                    raise  # the probe itself failed, promptly: not a stall
+                _set_iterm_status(ok=False, stalled_since_ms=stalled_since_ms)
+                await asyncio.wait_for(probe, timeout=WATCHDOG_TIMEOUT - STALL_AFTER)
         except asyncio.CancelledError:
+            probe.cancel()
             raise
         except Exception as err:
             failures += 1
@@ -945,11 +1132,51 @@ async def connection_watchdog(stop: asyncio.Event) -> None:
                 log(f"watchdog: iTerm2 answering again after {failures} slow "
                     "probe(s)")
             failures = 0
-        delay = WATCHDOG_RETRY_INTERVAL if failures else WATCHDOG_INTERVAL
+            _set_iterm_status(
+                ok=True, latency_ms=int((time.monotonic() - started) * 1000))
+        if failures:
+            delay = WATCHDOG_RETRY_INTERVAL
+        elif browser_clients:
+            delay = WATCHDOG_INTERVAL_BROWSER
+        else:
+            delay = WATCHDOG_INTERVAL
         try:
             await asyncio.wait_for(stop.wait(), timeout=delay)
         except asyncio.TimeoutError:
             pass
+
+
+async def _probe_iterm() -> None:
+    """The cheapest round trip iTerm2 offers: one app variable. The probe
+    used to be a full session listing, which iTerm2 renders as ~22 KB of
+    text for its Script Console every time (see live_tail)."""
+    await iterm2.rpc.async_variable(connection, gets=["pid"])
+
+
+def _set_iterm_status(*, ok: bool, stalled_since_ms: int | None = None,
+                      latency_ms: int | None = None) -> None:
+    """Record whether iTerm2 is answering, telling clients when that changes."""
+    was_ok = iterm_status["ok"]
+    if ok:
+        iterm_status.update(ok=True, stalledSince=None, latencyMs=latency_ms)
+        if not was_ok:
+            log(f"iTerm2 answering again ({latency_ms}ms)")
+    elif was_ok:
+        iterm_status.update(ok=False, stalledSince=stalled_since_ms,
+                            latencyMs=None)
+        log(f"iTerm2 not answering for {STALL_AFTER:.0f}s — telling clients")
+    else:
+        return
+    if ok != was_ok:
+        for sid in list(clients):
+            queue_client_event(sid, "itermStatus", "itermStatus",
+                               iterm_status_payload())
+
+
+def iterm_status_payload() -> dict:
+    """iterm_status plus this server's clock, so a client can count a stall
+    up in its own clock whatever the difference between the two."""
+    return {**iterm_status, "now": int(time.time() * 1000)}
 
 
 # --- Socket.IO handlers ---------------------------------------------------------
@@ -961,15 +1188,25 @@ async def seed_client(sid: str) -> None:
     Runs as a task rather than inline in `connect` — see the note there.
     """
     try:
+        await sio.emit("serverInfo", {"instance": SERVER_INSTANCE}, to=sid)
+        await sio.emit("itermStatus", iterm_status_payload(), to=sid)
         await sio.emit("screenSize", screen_size, to=sid)
-        await sio.emit("state", await build_state(), to=sid)
-        # A snapshot of whatever iTerm currently has focused.
+        # The last state pushed, at once, then a fresh one: during an iTerm2
+        # stall the fresh build takes as long as the stall.
+        if _last_state is not None:
+            await sio.emit("state", _last_state, to=sid)
+        # Whatever iTerm has focused, if a frame of it is at hand. No read is
+        # made for it here: the client's own `watch` follows at once and
+        # streams the pane it actually picks.
         session_id = current_active_session_id()
-        if session_id and sid in clients:
-            content = await read_content(session_id)
-            if content and content["lines"]:
-                await sio.emit(
-                    "content", {"sessionId": session_id, **content}, to=sid)
+        content = cached_content(session_id) if session_id else None
+        if content is not None:
+            await sio.emit(
+                "content", {"sessionId": session_id, **content, "cached": True},
+                to=sid)
+        # Through the outbox like every other state, so a newer state pushed
+        # while this one was being built is never overtaken by it.
+        await push_state(new_client=sid)
     except asyncio.CancelledError:
         raise
     except Exception as err:
@@ -1025,6 +1262,9 @@ async def disconnect(sid, reason=None):
     # Read before teardown: Engine.IO drops its socket once this returns.
     transport = _client_transport(sid)
     clients.discard(sid)
+    browser_clients.discard(sid)
+    for page in [p for p, s in sid_by_page.items() if s == sid]:
+        del sid_by_page[page]
     watched_by_sid.pop(sid, None)
     seed = seed_tasks.pop(sid, None)
     if seed is not None:
@@ -1051,24 +1291,22 @@ async def on_watch(sid, data):
     }
     watched_by_sid[sid] = sessions
 
-    # Immediately hand this client a snapshot of any pane that is *already* being
-    # streamed for another connection. A shared per-session stream emits its first
-    # frame only when its task is created (see stream_session), so a client that
-    # starts watching an already-streamed pane — e.g. a phone reconnecting after
-    # sleep while its previous connection's stream is still alive — would
-    # otherwise sit on "WAITING FOR OUTPUT" until that pane next changes. Panes
-    # not yet streamed are covered by the initial read in stream_session(), which
-    # apply_watches() starts below, so only pre-existing streams are seeded here.
+    # Immediately hand this client the latest frame this server holds for each
+    # pane. A shared per-session stream emits its first frame only when its task
+    # is created (see stream_session), so a client that starts watching an
+    # already-streamed pane — e.g. a phone reconnecting after sleep while its
+    # previous connection's stream is still alive — would otherwise sit on
+    # "WAITING FOR OUTPUT" until that pane next changes. A pane not streamed
+    # right now may still have a frame cached from earlier, which is drawn at
+    # once while the stream apply_watches() starts below reads a fresh one.
+    # Nothing is read from iTerm2 here: with no frame at hand, the stream's
+    # own first read is what the client gets.
     for session_id in sessions:
-        if session_id not in stream_tasks:
-            continue
-        content = last_content.get(session_id)
-        if content is None:
-            content = await read_content(session_id)
-        if content and content["lines"]:
+        content = cached_content(session_id)
+        if content is not None:
             queue_client_event(
                 sid, f"content:{session_id}", "content",
-                {"sessionId": session_id, **content})
+                {"sessionId": session_id, **content, "cached": True})
 
     await apply_watches()
 
@@ -1078,10 +1316,25 @@ async def on_hello(sid, data):
     # Client-reported context for a connection, logged for diagnosing
     # reconnect churn: whether this is a fresh page load or the same page
     # reconnecting, how the page saw its previous connection end, and what
-    # it could see of the network at the time. Data only; never acted on.
+    # it could see of the network at the time. It also marks the connection
+    # as a browser page, and says which page, so input it sent on an earlier
+    # connection can be reported delivered on this one.
     if not isinstance(data, dict):
         return
     log(f"hello {sid}: {json.dumps(data, sort_keys=True)[:500]}")
+    if sid not in clients:
+        return
+    browser_clients.add(sid)
+    page = data.get("page")
+    if isinstance(page, str) and page:
+        sid_by_page[page] = sid
+        stream = input_streams.get(page)
+        if stream is not None:
+            stream.sid = sid
+            stream.report_delivered()
+        elif page in delivered_by_page:
+            queue_client_event(sid, f"inputDelivered:{page}", "inputDelivered",
+                               {"page": page, "upto": delivered_by_page[page]})
 
 
 @sio.event
@@ -1092,6 +1345,10 @@ async def ping(sid):
 
 @sio.on("getContent")
 async def on_get_content(sid, data):
+    # Always a fresh read, never a cached frame: a programmatic client
+    # (aveiro) takes the first `content` it gets as the pane's current state,
+    # and checks it before typing into the pane. The phone does not use this;
+    # its `watch` is drawn from the cache and then streamed.
     session_id = data.get("sessionId")
     content = await read_content(session_id)
     if content and content["lines"]:
@@ -1128,13 +1385,155 @@ async def on_get_earlier_content(sid, data):
             {"sessionId": session_id, **content})
 
 
+# --- Input: ordered, acknowledged, never sent twice ----------------------------
+#
+# A keystroke or command emitted into a WebSocket that has just died is lost
+# without a trace: Socket.IO does not retransmit, and a phone on a tailnet
+# loses its socket every minute or so (docs/ARCHITECTURE.md, "Diagnosing
+# reconnects"). So a page numbers everything it types and keeps it until
+# this server says iTerm2 has it, resending on each reconnect. Here each
+# page's input runs through one queue, in order, and a number already
+# accepted is acknowledged again but never delivered twice.
+#
+# Two acknowledgements, because they fail differently: the Socket.IO ack
+# ("received") comes straight back, so a page that does not get one knows its
+# socket is dead; `inputDelivered` follows once iTerm2 has taken the text,
+# which during an iTerm2 stall is when the stall ends. Delivery is never
+# abandoned for taking long: the request is already on its way to iTerm2,
+# and giving up on the answer would not take it back.
+#
+# Messages without a page and sequence number (aveiro's) take the old,
+# unacknowledged path.
+
+# The last sequence number delivered for each page, kept after the page's
+# stream is dropped so a page that comes back is still answered correctly.
+delivered_by_page: "OrderedDict[str, int]" = OrderedDict()
+input_streams: dict[str, "InputStream"] = {}
+# Failures recalled per page, reported with every delivery update so one
+# that happened while the page was disconnected still reaches it.
+MAX_RECALLED_FAILURES = 20
+
+
+class InputStream:
+    """One page's input, delivered to iTerm2 strictly in the order typed."""
+
+    def __init__(self, page: str):
+        self.page = page
+        self.received = delivered_by_page.get(page, 0)
+        self.delivered = self.received
+        self.failures: "OrderedDict[int, str]" = OrderedDict()
+        self.sid: str | None = None
+        self.last_active = time.monotonic()
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._worker = asyncio.create_task(self._run())
+
+    def accept(self, seq: int, deliver) -> None:
+        """Queue ``deliver`` as input number ``seq``, unless it already was."""
+        self.last_active = time.monotonic()
+        if seq <= self.received:
+            return
+        if self.received and seq != self.received + 1:
+            log(f"input {self.page}: #{seq} arrived after #{self.received}; "
+                f"#{self.received + 1}..#{seq - 1} never did")
+        self.received = seq
+        self._queue.put_nowait((seq, deliver))
+
+    @property
+    def idle(self) -> bool:
+        return (self.delivered == self.received
+                and time.monotonic() - self.last_active > INPUT_STREAM_IDLE_SECONDS)
+
+    def failure_report(self) -> list:
+        return [{"seq": seq, "reason": reason}
+                for seq, reason in self.failures.items()]
+
+    def report_delivered(self) -> None:
+        if self.sid is None:
+            return
+        queue_client_event(
+            self.sid, f"inputDelivered:{self.page}", "inputDelivered",
+            {"page": self.page, "upto": self.delivered,
+             "failed": self.failure_report()})
+
+    async def stop(self) -> None:
+        self._worker.cancel()
+        await asyncio.gather(self._worker, return_exceptions=True)
+
+    async def _run(self) -> None:
+        while True:
+            seq, deliver = await self._queue.get()
+            try:
+                failure = await deliver()
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:
+                failure = f"iTerm2 refused it ({err})"
+            if failure:
+                log(f"input {self.page}#{seq} not delivered: {failure}")
+                self.failures[seq] = failure
+                while len(self.failures) > MAX_RECALLED_FAILURES:
+                    self.failures.popitem(last=False)
+            self.delivered = seq
+            self.last_active = time.monotonic()
+            delivered_by_page[self.page] = seq
+            delivered_by_page.move_to_end(self.page)
+            while len(delivered_by_page) > MAX_INPUT_PAGES:
+                delivered_by_page.popitem(last=False)
+            self.report_delivered()
+
+
+def _named_session(session_id) -> iterm2.Session | None:
+    """The pane a sequenced input names — and only that pane."""
+    if itermapp is None or not isinstance(session_id, str) or not session_id:
+        return None
+    return itermapp.get_session_by_id(session_id)
+
+
+def _accept_input(sid: str, data: dict, deliver) -> dict | None:
+    """Queue sequenced input and return its acknowledgement, or None for a
+    message without a page and sequence number (the unacknowledged path)."""
+    page = data.get("page")
+    seq = data.get("seq")
+    if not (isinstance(page, str) and page
+            and isinstance(seq, int) and not isinstance(seq, bool)):
+        return None
+    stream = input_streams.get(page)
+    if stream is None:
+        stream = input_streams[page] = InputStream(page)
+    current = sid_by_page.get(page)
+    stream.sid = current if current in clients else sid
+    stream.accept(seq, deliver)
+    # `failed` travels with `delivered`: `delivered` counts failures too, so
+    # a page told only the count would retire a failed input as delivered.
+    return {"ok": True, "instance": SERVER_INSTANCE,
+            "delivered": stream.delivered, "failed": stream.failure_report()}
+
+
+async def evict_idle_input_streams() -> None:
+    for page, stream in list(input_streams.items()):
+        if stream.idle:
+            del input_streams[page]
+            await stream.stop()
+
+
 @sio.on("execute")
 async def on_execute(sid, data):
     command = data.get("command", "")
-    session = resolve_session(data.get("sessionId"))
-    if session is not None:
+    session_id = data.get("sessionId")
+
+    async def deliver():
+        session = _named_session(session_id)
+        if session is None:
+            return "that pane has closed"
         # CR (0x0D), not LF: a real Return submits in shells (ICRNL maps CR->NL)
         # and in raw-mode TUIs like Claude Code, where LF only inserts a newline.
+        await session.async_send_text(command + "\r")
+
+    ack = _accept_input(sid, data, deliver)
+    if ack is not None:
+        return ack
+    session = resolve_session(session_id)
+    if session is not None:
         await session.async_send_text(command + "\r")
 
 
@@ -1142,6 +1541,23 @@ async def on_execute(sid, data):
 async def on_broadcast(sid, data):
     command = data.get("command", "")
     session_ids = data.get("sessionIds") or []
+
+    async def deliver():
+        sessions = [s for s in map(_named_session, session_ids) if s is not None]
+        results = await asyncio.gather(
+            *(s.async_send_text(command + "\r") for s in sessions),
+            return_exceptions=True)
+        missed = (len(session_ids) - len(sessions)
+                  + sum(isinstance(r, BaseException) for r in results))
+        if missed == len(session_ids):
+            return "none of those panes took it"
+        if missed:
+            return f"{missed} of {len(session_ids)} panes did not take it"
+
+    ack = _accept_input(sid, data, deliver)
+    if ack is not None:
+        _state_dirty.set()
+        return ack
     sessions = [itermapp.get_session_by_id(s) for s in session_ids] if itermapp else []
     await asyncio.gather(*(
         s.async_send_text(command + "\r") for s in sessions if s is not None))
@@ -1151,7 +1567,18 @@ async def on_broadcast(sid, data):
 @sio.on("sendKeys")
 async def on_send_keys(sid, data):
     keys = data.get("keys", "")
-    session = resolve_session(data.get("sessionId"))
+    session_id = data.get("sessionId")
+
+    async def deliver():
+        session = _named_session(session_id)
+        if session is None:
+            return "that pane has closed"
+        await session.async_send_text(keys)
+
+    ack = _accept_input(sid, data, deliver)
+    if ack is not None:
+        return ack
+    session = resolve_session(session_id)
     if session is not None:
         await session.async_send_text(keys)
 
@@ -1177,15 +1604,21 @@ async def on_split_pane(sid, data):
     # sessionId follows the same resolve_session convention as sendKeys/
     # execute/broadcast: split whichever pane the phone currently has
     # focused, which may differ from iTerm's own Mac-side focus.
+    #
+    # The acknowledgement names the new pane, so the phone can switch to it the
+    # way iTerm focuses a new split on the Mac.
     session = resolve_session((data or {}).get("sessionId"))
     if session is None:
-        return
+        return {"error": "that pane has closed"}
     vertical = bool((data or {}).get("vertical", True))
     try:
-        await session.async_split_pane(vertical=vertical)
+        created = await session.async_split_pane(vertical=vertical)
     except Exception as err:
         log(f"split pane failed: {err}")
+        await push_state()
+        return {"error": f"iTerm2 could not split it ({err})"}
     await push_state()
+    return {"sessionId": created.session_id}
 
 
 @sio.on("closePane")
@@ -1406,7 +1839,10 @@ async def main() -> None:
         for task in background_tasks:
             task.cancel()
         await asyncio.gather(*background_tasks, return_exceptions=True)
+        for stream in list(input_streams.values()):
+            await stream.stop()
         await stop_all_streams()
+        await asyncio.gather(*_retiring_streams, return_exceptions=True)
         for sid in list(delivery_tasks):
             clients.discard(sid)
             await stop_client_delivery(sid)
