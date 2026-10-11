@@ -39,6 +39,7 @@ try:
         load_or_create_key,
     )
     from .geometry import pane_layout
+    from .iterm_cookie import use_osascript_for_cookie
     from .live_tail import LiveTail, TailFrame
     from .terminal_lines import async_get_lines_and_cursor
 except ImportError:  # Running server.py directly from the server directory.
@@ -51,6 +52,7 @@ except ImportError:  # Running server.py directly from the server directory.
         load_or_create_key,
     )
     from geometry import pane_layout
+    from iterm_cookie import use_osascript_for_cookie
     from live_tail import LiveTail, TailFrame
     from terminal_lines import async_get_lines_and_cursor
 
@@ -1763,6 +1765,7 @@ async def main() -> None:
 
     shared_key = load_or_create_key()
 
+    use_osascript_for_cookie()
     connection = await iterm2.Connection.async_create()
     itermapp = await iterm2.async_get_app(connection)
 

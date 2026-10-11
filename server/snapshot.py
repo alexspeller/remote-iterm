@@ -40,11 +40,13 @@ import iterm2.rpc
 try:
     from .ascii_layout import render as render_ascii
     from .geometry import pane_layout, serialize_tree
+    from .iterm_cookie import use_osascript_for_cookie
     from .terminal_lines import (
         ansi_text, async_get_lines, async_get_lines_and_cursor, plain_text)
 except ImportError:  # Running directly from the server directory.
     from ascii_layout import render as render_ascii
     from geometry import pane_layout, serialize_tree
+    from iterm_cookie import use_osascript_for_cookie
     from terminal_lines import (
         ansi_text, async_get_lines, async_get_lines_and_cursor, plain_text)
 
@@ -864,4 +866,5 @@ async def main(connection) -> None:
 
 
 if __name__ == "__main__":
+    use_osascript_for_cookie()
     iterm2.run_forever(main)

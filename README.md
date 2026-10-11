@@ -176,7 +176,8 @@ mise exec -- npm --prefix client test
 mise exec -- server/.venv/bin/python -m unittest \
   server.test_server server.test_auth server.test_geometry \
   server.test_ascii_layout server.test_snapshot server.test_restore \
-  server.test_terminal_lines server.test_live_tail server.test_resilience
+  server.test_terminal_lines server.test_live_tail server.test_resilience \
+  server.test_iterm_cookie
 ```
 
 The snapshot, geometry, ASCII-layout, and restore unit tests are pure Python and need neither a phone nor a running iTerm2. The client tests run under vitest: the deep-link parsing is pure, and the command-box tests render the real `App` in jsdom with only the socket faked.

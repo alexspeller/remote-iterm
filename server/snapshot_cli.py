@@ -23,9 +23,11 @@ import iterm2
 
 try:
     from . import snapshot as snap
+    from .iterm_cookie import use_osascript_for_cookie
     from .restore import plan_text, restore
 except ImportError:
     import snapshot as snap
+    from iterm_cookie import use_osascript_for_cookie
     from restore import plan_text, restore
 
 
@@ -229,6 +231,7 @@ def main() -> int:
     sub.add_parser("install", help="install the AutoLaunch supervisor")
 
     args = parser.parse_args()
+    use_osascript_for_cookie()
     handlers = {
         "show": cmd_show, "list": cmd_list, "snapshot": cmd_snapshot,
         "restore": cmd_restore, "install": cmd_install,
