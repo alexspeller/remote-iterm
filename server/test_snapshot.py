@@ -18,6 +18,22 @@ from server.test_geometry import FakeSplit
 from server.test_terminal_lines import line, proto_line
 
 
+def setUpModule():
+    # What the code under test logs ("snapshotter started", "received stop
+    # signal", watchdog timeouts) goes to a scratch log, not the live one a
+    # running snapshotter writes and its diagnosis is read from.
+    global _log_dir, _real_log
+    _log_dir = tempfile.TemporaryDirectory()
+    _real_log = (S.SNAPSHOT_DIR, S.LOG_PATH)
+    S.SNAPSHOT_DIR = Path(_log_dir.name)
+    S.LOG_PATH = S.SNAPSHOT_DIR / "snapshot.log"
+
+
+def tearDownModule():
+    S.SNAPSHOT_DIR, S.LOG_PATH = _real_log
+    _log_dir.cleanup()
+
+
 def make_clean(cwd="/Users/x/proj", captured="2026-08-19T10:00:00+00:00"):
     return {
         "version": 1,
