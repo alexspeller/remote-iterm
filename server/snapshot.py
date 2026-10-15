@@ -70,7 +70,11 @@ MAX_SESSION_ARCHIVES = 20
 DEBOUNCE_SECONDS = 1.5       # coalesce a burst of change notifications
 MIN_INTERVAL_SECONDS = 10.0  # floor between successive snapshots
 HEARTBEAT_SECONDS = 30.0     # guarantee freshness + refresh content/cwd/job
-CONTENT_TTL_SECONDS = 30.0   # don't re-read a pane's content more often than this
+# Between heartbeats, a pane read this recently isn't asked about at all. A
+# heartbeat asks about every pane read before it, however recently, since its
+# timer and the panes' read times drift apart and the shortcut would otherwise
+# leave a pane's new output out of the snapshot for a whole extra heartbeat.
+CONTENT_TTL_SECONDS = 30.0
 # A pane's tail is re-read only when its buffer has visibly moved — output
 # scrolled, the pane was resized or cleared — or when this much time has
 # passed regardless. Most panes are idle at any moment, and each tail read is
@@ -287,6 +291,9 @@ class Snapshotter:
         # (plain, styled)) so rapid triggers don't re-read all panes, and an
         # idle pane is not re-read at all until CONTENT_MAX_AGE_SECONDS.
         self.content_cache: dict[str, tuple[float, tuple, tuple[str, str]]] = {}
+        # Monotonic time of the last heartbeat: entries read before it are
+        # checked against the live buffer, however recently they were read.
+        self.recheck_before = float("-inf")
         # session_id -> profile custom initial directory ("" if not custom). Read
         # once; a profile's working-directory setting doesn't change per session.
         self.custom_dir_cache: dict[str, str] = {}
@@ -323,7 +330,8 @@ class Snapshotter:
     async def _content_for(self, session) -> tuple[str, str]:
         now = time.monotonic()
         cached = self.content_cache.get(session.session_id)
-        if cached is not None and now - cached[0] < CONTENT_TTL_SECONDS:
+        if (cached is not None and now - cached[0] < CONTENT_TTL_SECONDS
+                and cached[0] >= self.recheck_before):
             return cached[2]
         try:
             info = await session.async_get_line_info()
@@ -628,8 +636,10 @@ class Snapshotter:
     async def _heartbeat(self) -> None:
         while True:
             await asyncio.sleep(HEARTBEAT_SECONDS)
-            # Heartbeat forces a full content refresh by aging out the cache.
-            self.content_cache.clear()
+            # Have the build this triggers check every pane for movement.
+            # Clearing the cache instead would re-read every pane's whole
+            # tail, moved or not, every heartbeat.
+            self.recheck_before = time.monotonic()
             self.trigger.set()
 
     async def _layout_monitor(self) -> None:

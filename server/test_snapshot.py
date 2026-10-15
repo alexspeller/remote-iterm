@@ -8,9 +8,14 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import iterm2
+import iterm2.rpc
+from iterm2 import api_pb2
+
 from server import snapshot as S
 from server.restore import pane_ids, split_count
-from server.test_terminal_lines import line
+from server.test_geometry import FakeSplit
+from server.test_terminal_lines import line, proto_line
 
 
 def make_clean(cwd="/Users/x/proj", captured="2026-08-19T10:00:00+00:00"):
@@ -586,6 +591,174 @@ class ContentReadTest(unittest.IsolatedAsyncioTestCase):
         self.pane.async_get_line_info = AsyncMock(side_effect=AssertionError("asked"))
         await self.snapshotter._content_for(self.pane)
         self.assertEqual(self.pane.tail_reads, 1)
+
+
+class _BufferPane(iterm2.Session):
+    """An iTerm2 pane with a real buffer of text rows on a 80x24 screen,
+    answering line-info requests itself and buffer reads through
+    ``_FakeBuffers``. Subclasses iterm2.Session for geometry's isinstance
+    check, without its constructor's connection."""
+
+    def __init__(self, sid):
+        self._sid = sid
+        self.connection = None
+        self.name = "fish"
+        self.frame = type("Frame", (), {"size": type("Size", (), {
+            "width": 640.0, "height": 400.0})()})()
+        self.rows = [f"{sid} line {i}" for i in range(40)]
+        self.cursor = (0, 39)
+
+    @property
+    def session_id(self):
+        return self._sid
+
+    @property
+    def grid_size(self):
+        return type("Size", (), {"width": 80, "height": 24})()
+
+    def output(self, text):
+        self.rows.append(text)
+        self.cursor = (0, len(self.rows) - 1)
+
+    async def async_get_line_info(self):
+        return type("Info", (), {
+            "overflow": 0,
+            "scrollback_buffer_height": max(0, len(self.rows) - 24),
+            "mutable_area_height": 24})()
+
+    async def async_get_variable(self, name):
+        return ""
+
+    async def async_get_profile(self):
+        raise RuntimeError("no profile in tests")
+
+
+class _FakeBuffers:
+    """Stands in for iTerm2's get_buffer RPC, recording how many lines each
+    request asked for: a one-line request is the snapshotter's cursor check,
+    anything longer a tail read."""
+
+    def __init__(self, panes):
+        self.panes = {pane.session_id: pane for pane in panes}
+        self.requests: list[tuple[str, int]] = []
+
+    async def __call__(self, connection, session, windowed_coord_range=None,
+                       style=False):
+        pane = self.panes[session]
+        rng = windowed_coord_range.coordRange
+        first, end = rng.start.y, rng.end.y
+        self.requests.append((session, end - first))
+        message = api_pb2.ServerOriginatedMessage()
+        buffer = message.get_buffer_response
+        buffer.status = api_pb2.GetBufferResponse.Status.Value("OK")
+        for row in pane.rows[first:end]:
+            buffer.contents.add().CopyFrom(proto_line(list(row)))
+        buffer.cursor.x, buffer.cursor.y = pane.cursor
+        return message
+
+    def tail_reads(self) -> list[str]:
+        return [sid for sid, count in self.requests if count > 1]
+
+
+class HeartbeatContentTest(unittest.IsolatedAsyncioTestCase):
+    """The heartbeat keeps the snapshot fresh without re-reading panes that
+    have not moved: each tail read is ~200 styled lines that iTerm2 renders
+    as hundreds of KB of text on its main thread."""
+
+    def setUp(self):
+        self.now = 1000.0
+        # The real interval, for the fake clock; the task itself is made to
+        # beat at once.
+        self.beat = S.HEARTBEAT_SECONDS
+        self.idle = _BufferPane("p:idle")
+        self.busy = _BufferPane("p:busy")
+        tab = type("Tab", (), {
+            "tab_id": "t1",
+            "root": FakeSplit(True, [self.idle, self.busy]),
+            "minimized_sessions": [],
+            "all_sessions": [self.idle, self.busy],
+            "current_session": self.idle,
+            "async_get_variable": AsyncMock(return_value=""),
+        })()
+        window = type("Window", (), {
+            "window_id": "w1", "tabs": [tab], "current_tab": tab,
+            "async_get_frame": AsyncMock(side_effect=RuntimeError("no frame")),
+        })()
+        app = type("App", (), {"terminal_windows": [window],
+                               "current_window": window})()
+        self.snapshotter = S.Snapshotter(connection=None, app=app)
+        self.buffers = _FakeBuffers([self.idle, self.busy])
+        clock = type("Clock", (), {"monotonic": staticmethod(lambda: self.now)})
+        for entry in (patch.object(iterm2.rpc, "async_get_screen_contents", self.buffers),
+                      patch.object(S, "time", clock),
+                      patch.object(S, "PANE_READ_DELAY", 0),
+                      patch.object(S, "HEARTBEAT_SECONDS", 0)):
+            entry.start()
+            self.addCleanup(entry.stop)
+
+    async def heartbeat(self):
+        """One beat of the real heartbeat task, and the build it triggers."""
+        task = asyncio.create_task(self.snapshotter._heartbeat())
+        try:
+            await asyncio.wait_for(self.snapshotter.trigger.wait(), timeout=5)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self.snapshotter.trigger.clear()
+        self.buffers.requests.clear()
+        return await self.snapshotter.build()
+
+    def content(self, snapshot, pane):
+        panes = snapshot["windows"][0]["tabs"][0]["panes"]
+        return next(p["_content"] for p in panes if p["id"] == pane.session_id)
+
+    async def test_a_heartbeat_issues_no_tail_read_for_an_unmoved_pane(self):
+        await self.snapshotter.build()
+        self.now += self.beat
+        snapshot = await self.heartbeat()
+        self.assertEqual(self.buffers.tail_reads(), [])
+        self.assertIn("p:idle line 39", self.content(snapshot, self.idle))
+
+    async def test_idle_panes_cost_no_tail_reads_across_many_heartbeats(self):
+        await self.snapshotter.build()
+        reads = []
+        while self.now + self.beat < 1000.0 + S.CONTENT_MAX_AGE_SECONDS:
+            self.now += self.beat
+            await self.heartbeat()
+            reads += self.buffers.tail_reads()
+        self.assertEqual(reads, [])
+
+    async def test_a_heartbeat_rereads_only_the_pane_with_new_output(self):
+        await self.snapshotter.build()
+        self.now += self.beat
+        self.busy.output("fresh output")
+        snapshot = await self.heartbeat()
+        self.assertEqual(self.buffers.tail_reads(), ["p:busy"])
+        self.assertTrue(self.content(snapshot, self.busy).endswith("fresh output"))
+
+    async def test_a_heartbeat_checks_a_pane_read_moments_before_it(self):
+        # The heartbeat's timer and each pane's read time drift: a pane read
+        # just under CONTENT_TTL_SECONDS before a heartbeat is still checked
+        # by it, so the snapshot is never a whole extra heartbeat behind.
+        await self.snapshotter.build()
+        self.now += S.CONTENT_TTL_SECONDS - 1
+        self.busy.output("fresh output")
+        snapshot = await self.heartbeat()
+        self.assertEqual(self.buffers.tail_reads(), ["p:busy"])
+        self.assertTrue(self.content(snapshot, self.busy).endswith("fresh output"))
+
+    async def test_a_heartbeat_still_rereads_an_idle_pane_at_the_max_age(self):
+        await self.snapshotter.build()
+        self.now += S.CONTENT_MAX_AGE_SECONDS
+        await self.heartbeat()
+        self.assertEqual(sorted(self.buffers.tail_reads()), ["p:busy", "p:idle"])
+
+    async def test_builds_between_heartbeats_ask_nothing_within_the_ttl(self):
+        await self.snapshotter.build()
+        self.now += 1
+        self.buffers.requests.clear()
+        await self.snapshotter.build()
+        self.assertEqual(self.buffers.requests, [])
 
 
 class ForgetClosedTest(unittest.TestCase):
