@@ -3,6 +3,7 @@ import json
 import os
 import signal
 import tempfile
+import time
 import unittest
 from datetime import date
 from pathlib import Path
@@ -349,6 +350,115 @@ class SnapshotTimeoutTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(written), 1)
 
+    async def test_an_abandoned_build_says_how_far_it_got(self):
+        # Whether iTerm2 was slow on every pane or stuck on one is the first
+        # question about an abandoned build, and only the build knows.
+        messages = []
+        ready, stuck = _BufferPane("p:ready"), _StuckPane("p:stuck")
+        snapshotter = S.Snapshotter(connection=None,
+                                    app=_one_tab_app([ready, stuck]))
+        with patch.object(iterm2.rpc, "async_get_screen_contents",
+                          _FakeBuffers([ready, stuck])), \
+             patch.object(S, "PANE_READ_DELAY", 0), \
+             patch.object(S, "SNAPSHOT_TIMEOUT_SECONDS", 0.2), \
+             patch.object(S, "log", messages.append):
+            await asyncio.wait_for(snapshotter.snapshot(), timeout=5)
+
+        abandoned = [m for m in messages if "abandoned" in m]
+        self.assertEqual(len(abandoned), 1, messages)
+        self.assertIn("1 of 2 panes read", abandoned[0])
+
+
+class SchedulerRestTest(unittest.IsolatedAsyncioTestCase):
+    """After a slow build the scheduler rests as long as the build took, so
+    the snapshotter never takes more than about half of a struggling
+    iTerm2's answering capacity. That rest protects iTerm2 only while it is
+    still slow: held after iTerm2 has recovered, it kept the live snapshot
+    a whole extra build-timeout out of date."""
+
+    TIMEOUT = 1.0
+
+    async def run_scheduler(self, builds, probe):
+        """Runs the real scheduler through ``builds`` (one coroutine function
+        per build, in order) with iTerm2's cheapest round trip answered by
+        ``probe``; returns the monotonic time each build started."""
+        snapshotter = S.Snapshotter(connection=None, app=None)
+        starts = []
+        finished = asyncio.Event()
+
+        async def build(_self):
+            starts.append(time.monotonic())
+            # The heartbeat keeps firing while a build runs.
+            snapshotter.trigger.set()
+            step = builds[len(starts) - 1]
+            if len(starts) == len(builds):
+                finished.set()
+            return await step()
+
+        with patch.object(S, "DEBOUNCE_SECONDS", 0), \
+             patch.object(S, "MIN_INTERVAL_SECONDS", 0.05), \
+             patch.object(S, "SNAPSHOT_TIMEOUT_SECONDS", self.TIMEOUT), \
+             patch.object(S, "log", lambda *a, **k: None), \
+             patch.object(S, "_probe_iterm", probe), \
+             patch.object(S.Snapshotter, "build", build), \
+             patch.object(S.Snapshotter, "_write_latest",
+                          lambda self, snap: snap), \
+             patch.object(S.Snapshotter, "_append_history",
+                          lambda self, clean: None):
+            snapshotter.trigger.set()
+            task = asyncio.create_task(snapshotter._scheduler())
+            try:
+                await asyncio.wait_for(finished.wait(), timeout=10)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        return starts
+
+    @staticmethod
+    async def never_finishes():
+        await asyncio.Event().wait()
+
+    @staticmethod
+    async def quick():
+        return {"windows": [{"id": "w1"}]}
+
+    async def test_retries_soon_after_an_abandoned_build_once_iterm2_answers(self):
+        answers = AsyncMock(return_value=None)
+
+        starts = await self.run_scheduler([self.never_finishes, self.quick],
+                                          answers)
+
+        # The abandoned build took the whole timeout; the retry follows it
+        # once iTerm2 has answered, not a second timeout later.
+        self.assertLess(starts[1] - starts[0], self.TIMEOUT + 0.5)
+        answers.assert_awaited()
+
+    async def test_still_rests_after_an_abandoned_build_while_iterm2_is_slow(self):
+        async def slow(_connection):
+            await asyncio.sleep(30)
+
+        starts = await self.run_scheduler([self.never_finishes, self.quick],
+                                          slow)
+
+        self.assertGreaterEqual(starts[1] - starts[0], 2 * self.TIMEOUT - 0.05)
+
+    async def test_still_rests_when_iterm2_cannot_be_asked(self):
+        refused = AsyncMock(side_effect=RuntimeError("connection refused"))
+
+        starts = await self.run_scheduler([self.never_finishes, self.quick],
+                                          refused)
+
+        self.assertGreaterEqual(starts[1] - starts[0], 2 * self.TIMEOUT - 0.05)
+
+    async def test_quick_builds_are_paced_without_asking_iterm2_anything(self):
+        probe = AsyncMock(return_value=None)
+
+        starts = await self.run_scheduler([self.quick] * 3, probe)
+
+        for earlier, later in zip(starts, starts[1:]):
+            self.assertGreaterEqual(later - earlier, 0.05)
+        probe.assert_not_awaited()
+
 
 class ConnectionDeadTest(unittest.IsolatedAsyncioTestCase):
     """Same distinction as server.py's identical helper: slow is not dead."""
@@ -674,6 +784,32 @@ class _FakeBuffers:
 
     def tail_reads(self) -> list[str]:
         return [sid for sid, count in self.requests if count > 1]
+
+
+class _StuckPane(_BufferPane):
+    """A pane iTerm2 never answers about."""
+
+    async def async_get_line_info(self):
+        await asyncio.Event().wait()
+
+
+def _one_tab_app(panes):
+    """An iTerm2 app holding one window with one tab of ``panes``, side by
+    side."""
+    tab = type("Tab", (), {
+        "tab_id": "t1",
+        "root": FakeSplit(True, panes),
+        "minimized_sessions": [],
+        "all_sessions": panes,
+        "current_session": panes[0],
+        "async_get_variable": AsyncMock(return_value=""),
+    })()
+    window = type("Window", (), {
+        "window_id": "w1", "tabs": [tab], "current_tab": tab,
+        "async_get_frame": AsyncMock(side_effect=RuntimeError("no frame")),
+    })()
+    return type("App", (), {"terminal_windows": [window],
+                            "current_window": window})()
 
 
 class HeartbeatContentTest(unittest.IsolatedAsyncioTestCase):
