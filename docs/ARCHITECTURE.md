@@ -110,11 +110,12 @@ A stdlib-only iTerm2 AutoLaunch script (installed via `iterm-snapshot install`) 
 
 **Restart evidence.** The supervisor restarts the phone server only after its port has failed `SERVER_DOWN_POLLS` consecutive probes (15 s at the 5 s interval, each probe allowed 2 s), because a restart drops every connected phone and one failed half-second connect is not a dead server: on 2026-09-19 a single miss ran `start`, whose orphan sweep then killed a server whose event loop was demonstrably healthy. The snapshotter check stays immediate, since it is pid-based rather than a network probe.
 
-**Startup contract.** `iterm-server start` is slow by design: it holds its lock until the children it spawned are actually listening, so the supervisor's 5s poll queues behind a start in progress instead of racing it. Three rules keep that from turning into a livelock, all of which have failed in practice at least once:
+**Startup contract.** `iterm-server start` is slow by design: it holds its lock until the children it spawned are actually listening, so the supervisor's 5s poll queues behind a start in progress instead of racing it. Four rules keep that from turning into a livelock or a wedge, all of which have failed in practice at least once:
 
 1. A `server.py` that exists but has not bound 7291 yet is *adopted and waited for*, not killed — it is usually still handshaking with iTerm2, which takes minutes on a loaded Mac. Respawning instead means no attempt ever gets long enough to finish, since the next poll arrives every 5s. Only once a process passes `SERVER_START_SECONDS` is it treated as stuck and reaped.
 2. The supervisor's `START_TIMEOUT` must stay comfortably above `iterm-server`'s worst case (`LOCK_WAIT_SECONDS + SERVER_START_SECONDS + CLIENT_START_SECONDS`). If the supervisor's kill lands first, the shell dies without releasing the lock.
-3. The lock records its holder's pid and any run may reclaim it once that holder is gone, because SIGKILL cannot be trapped. Without this a single mistimed kill wedges every subsequent start.
+3. The lock records its holder's pid and start time, and any run may reclaim it once that holder is gone (or its pid now belongs to another process), because SIGKILL cannot be trapped. Without this a single mistimed kill wedges every subsequent start.
+4. Every wait under the lock is bounded, and a holder alive past `LOCK_HOLD_SECONDS` (the supervisor's `START_TIMEOUT`) is killed by the next run. Each loopback probe gets `PROBE_SECONDS` before a watchdog kills it: on 2026-10-21 a `connect()` to 7291 never returned, and its launcher held the lock for six days, so neither the supervisor nor the phone's restart button could do anything. The supervisor's own timeout did not end it, because the timeout kills the login shell the launcher runs under, and fish, unlike bash and zsh, does not exec its last command. So the launcher has to enforce the hold limit itself.
 
 ## Socket.IO contract
 

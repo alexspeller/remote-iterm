@@ -1,7 +1,7 @@
 #!/bin/bash
 # Remote iTerm — Python server (7291) + built web client (7292)
 
-SOURCE="$0"
+SOURCE="${BASH_SOURCE[0]}"
 while [ -L "$SOURCE" ]; do SOURCE="$(readlink "$SOURCE")"; done
 DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
 
@@ -30,6 +30,17 @@ LOCK_WAIT_SECONDS=${LOCK_WAIT_SECONDS:-90}
 # to minutes — stalls of 65s, 88s and 118s have all been measured here.
 SERVER_START_SECONDS=${SERVER_START_SECONDS:-180}
 CLIENT_START_SECONDS=${CLIENT_START_SECONDS:-120}
+# A launcher still holding the lock this long is past every budget above and
+# is wedged, not slow. Matches the supervisor's START_TIMEOUT, which already
+# has to exceed the worst case. The supervisor's own timeout cannot be relied
+# on to stop a wedged launcher: it kills the login shell it ran us through,
+# and fish, unlike bash and zsh, does not exec its last command, so under fish
+# this script outlives the kill. That is how one start from 2026-10-21 held
+# the lock for six days.
+LOCK_HOLD_SECONDS=${LOCK_HOLD_SECONDS:-600}
+# One loopback connect. A listening port answers in milliseconds; a connect
+# still pending after this is treated as "not listening" rather than waited on.
+PROBE_SECONDS=${PROBE_SECONDS:-1}
 
 now_seconds() { date +%s; }
 
@@ -55,9 +66,14 @@ with_lock() {
     # full budget on an abandoned lock and then fail exactly the same way.
     # Renaming before deleting keeps the recovery itself race-free: two
     # processes can both see the dead holder, but only one `mv` can succeed,
-    # and the loser simply finds the directory already gone and loops.
+    # and the loser simply finds the directory already gone and loops. A
+    # holder whose pid now belongs to another process is gone too, and one
+    # alive but past LOCK_HOLD_SECONDS is killed first. Re-reading the pid
+    # just before the rename keeps a lock that changed hands meanwhile from
+    # being taken for the old holder's.
     holder="$(cat "$LOCKDIR/pid" 2>/dev/null)"
-    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+    if [ -n "$holder" ] && ! holder_alive "$holder" \
+       && [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$holder" ]; then
       stale="$LOCKDIR.stale.$$"
       if mv "$LOCKDIR" "$stale" 2>/dev/null; then
         echo "  Cleared stale lock left by dead process $holder" >&2
@@ -65,12 +81,16 @@ with_lock() {
       fi
       continue
     fi
+    [ -n "$holder" ] && kill_wedged_holder "$holder" && continue
     if [ "$(now_seconds)" -ge "$deadline" ]; then
       echo "  Timed out waiting for another iterm-server operation to finish" >&2
       return 1
     fi
     sleep 0.2
   done
+  # started before pid, so a holder whose pid is readable can always be
+  # identified.
+  proc_started $$ > "$LOCKDIR/started"
   echo $$ > "$LOCKDIR/pid"
   # EXIT, not RETURN: bash 3.2's RETURN trap does not reliably fire on the
   # return of the function that set it — it can skip that one and fire on a
@@ -92,6 +112,47 @@ with_lock() {
 # with us can never delete the lock its winner just took.
 release_lock() {
   [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCKDIR" 2>/dev/null
+  return 0
+}
+
+# Start time of pid $1 as ps prints it: with the pid, it identifies one process
+# for good, where a pid alone may since have been handed to another.
+proc_started() {
+  ps -o lstart= -p "$1" 2>/dev/null
+}
+
+# True if lock holder $1 is still the process that took the lock. A recycled
+# pid or an unreaped zombie holds nothing. A lock without a recorded start
+# time falls back to the bare pid check.
+holder_alive() {
+  local started stat
+  kill -0 "$1" 2>/dev/null || return 1
+  stat="$(ps -o stat= -p "$1" 2>/dev/null)"
+  case "$stat" in Z*) return 1 ;; esac
+  started="$(cat "$LOCKDIR/started" 2>/dev/null)"
+  [ -z "$started" ] || [ "$(proc_started "$1")" = "$started" ]
+}
+
+# Kill lock holder $1 if it has held on past LOCK_HOLD_SECONDS, so the next
+# pass of with_lock's loop finds it dead and clears the lock. Only a holder
+# whose recorded start time matches is touched, so this can never kill an
+# unrelated process that inherited the pid. SIGKILL because bash defers a
+# trapped TERM until its foreground child returns, and a wedged child is
+# exactly what never returns. Its subshells (the same command line) go with it;
+# the daemons it started exec'd into other programs and are left running.
+kill_wedged_holder() {
+  local holder="$1" started age cmd child
+  started="$(cat "$LOCKDIR/started" 2>/dev/null)"
+  [ -n "$started" ] && [ "$(proc_started "$holder")" = "$started" ] || return 1
+  age="$(proc_age_seconds "$holder")" || return 1
+  [ "$age" -ge "$LOCK_HOLD_SECONDS" ] || return 1
+  cmd="$(ps -o command= -p "$holder" 2>/dev/null)"
+  for child in $(pgrep -P "$holder" 2>/dev/null); do
+    [ "$(ps -o command= -p "$child" 2>/dev/null)" = "$cmd" ] && kill -9 "$child" 2>/dev/null
+  done
+  echo "  Killing iterm-server $holder: it has held the lock for over ${LOCK_HOLD_SECONDS}s" >&2
+  kill -9 "$holder" 2>/dev/null
+  sleep 0.2
   return 0
 }
 
@@ -178,13 +239,42 @@ ensure_client_build() {
   return 1
 }
 
-# True if anything is listening on $1. bash's /dev/tcp costs ~0.007s against
-# lsof's ~0.12s, which matters because the wait loop calls this hundreds of
-# times: built on lsof, a nominally 45s wait actually ran ~100s of wall clock
-# and so collided with the supervisor's kill timeout. Only use lsof where the
-# *pid* holding the port is needed, not for a plain liveness question.
+# True if anything is listening on $1. bash's /dev/tcp, even with the
+# watchdog below, costs ~0.02s against lsof's ~0.12s, which matters because
+# the wait loop calls this hundreds of times: built on lsof, a nominally 45s
+# wait actually ran ~100s of wall clock and so collided with the supervisor's
+# kill timeout. Only use lsof where the *pid* holding the port is needed, not
+# for a plain liveness question.
+#
+# The connect gets PROBE_SECONDS. Unbounded, one that never returned (blocked
+# in connect() on loopback with the socket already ESTABLISHED, 2026-10-21)
+# kept its launcher holding the lock for six days, so nothing could start or
+# restart the stack. Why it hung is unknown, so the bound is a SIGKILL, which
+# is what ended that one, rather than a TCP-level timeout such as nc's that
+# may not cover whatever the kernel was waiting on. The connect runs as the
+# background job itself, not a subshell under it, so the kill lands on the
+# process that is stuck. The watchdog has no stdio, so it never holds a
+# caller's pipe open, and stops its own sleep when it is called off.
+connect_port() {
+  exec 3<>"/dev/tcp/127.0.0.1/$1"
+}
+
 port_listening() {
-  (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+  local probe watchdog rc
+  connect_port "$1" 2>/dev/null &
+  probe=$!
+  ( trap 'kill "$nap"; exit 0' TERM
+    sleep "$PROBE_SECONDS" & nap=$!
+    wait "$nap"
+    kill -9 "$probe" ) </dev/null >/dev/null 2>&1 &
+  watchdog=$!
+  wait "$probe" 2>/dev/null
+  rc=$?
+  kill "$watchdog" 2>/dev/null
+  # Reaped here, with stderr closed, so bash has no job to report if the
+  # watchdog was stopped before its trap was in place.
+  wait "$watchdog" 2>/dev/null
+  return $rc
 }
 
 # Wait up to $3 seconds for port $1 to be listening, giving up early if the
@@ -522,6 +612,12 @@ log_invocation() {
     "$(date +%Y-%m-%dT%H:%M:%S)" "${1:-start}" "$$" "$PPID" "${parent:-?}" "$(tty 2>/dev/null || echo none)" \
     >> "$LOGFILE"
 }
+
+# Sourced (server/test_launcher.py), only the functions above are wanted.
+# `return` only succeeds in a sourced file. Comparing BASH_SOURCE with $0
+# does not work: under `bash -c 'source "$0"' path` the two are equal.
+if (return 0 2>/dev/null); then return 0; fi
+
 log_invocation "$1"
 
 case "${1:-start}" in
