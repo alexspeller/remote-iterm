@@ -48,7 +48,10 @@ PROBE_TIMEOUT = 2.0
 # waits out its whole budget before failing the same way — which is how a
 # recoverable slow start turned into a 68-minute outage on 2026-09-02.
 # Overshooting costs nothing: while `start` runs it is already doing the work
-# this loop would otherwise wake up and ask for again.
+# this loop would otherwise wake up and ask for again. The kill reaches the
+# login shell, which only bash and zsh replace with the launcher; under fish
+# the launcher outlives it, so iterm-server's LOCK_HOLD_SECONDS, kept equal
+# to this, is what finally ends a launcher that is stuck.
 START_TIMEOUT = 600
 
 _original_ppid = os.getppid()
