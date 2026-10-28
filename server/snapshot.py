@@ -99,6 +99,13 @@ PANE_READ_DELAY = 0.05
 # Safe to cancel mid-build precisely because _read_tail avoids
 # iterm2.Transaction (see the note there).
 SNAPSHOT_TIMEOUT_SECONDS = 300.0
+# After a slow build the scheduler rests as long as the build took (see
+# _rest), but only while iTerm2 is still slow: every this often during
+# that rest it asks iTerm2 its cheapest question, and an answer within
+# PROMPT_ANSWER_SECONDS ends the rest. A responsive iTerm2 answers it in
+# milliseconds; a stalled one took seconds, when it answered at all.
+REST_PROBE_INTERVAL = 5.0
+PROMPT_ANSWER_SECONDS = 1.0
 
 # How often the watchdog proves the iTerm2 connection is actually answering
 # RPCs (not just open), and how long it waits for one round trip. Same
@@ -279,11 +286,42 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
+class BuildProgress:
+    """How far the build in flight has got. From outside, iTerm2 answering
+    every pane slowly and iTerm2 never answering about one pane look the
+    same; an abandoned build's log line says which it was."""
+
+    def __init__(self):
+        self.panes = 0
+        self.read = 0
+        self.slowest = 0.0
+        self._pane_began: float | None = None
+
+    def pane_started(self) -> None:
+        self._pane_began = time.monotonic()
+
+    def pane_finished(self) -> None:
+        if self._pane_began is not None:
+            self.slowest = max(self.slowest,
+                               time.monotonic() - self._pane_began)
+        self._pane_began = None
+        self.read += 1
+
+    def describe(self) -> str:
+        text = (f"{self.read} of {self.panes} panes read, slowest "
+                f"{self.slowest:.1f}s")
+        if self._pane_began is not None:
+            text += (f", the next unanswered for "
+                     f"{time.monotonic() - self._pane_began:.1f}s")
+        return text
+
+
 class Snapshotter:
     def __init__(self, connection, app):
         self.connection = connection
         self.app = app
         self.trigger = asyncio.Event()
+        self.progress = BuildProgress()
         # tab_id -> {"rects", "aspect", "tree"} last captured while NOT maximized,
         # so a currently-maximized tab still renders/restores its real layout.
         self.last_good: dict[str, dict] = {}
@@ -449,8 +487,10 @@ class Snapshotter:
 
         panes = []
         for session in tab.all_sessions:
+            self.progress.pane_started()
             panes.append(
                 await self._pane_entry(session, rects.get(session.session_id)))
+            self.progress.pane_finished()
             await asyncio.sleep(PANE_READ_DELAY)
         cur = tab.current_session
         return {
@@ -469,6 +509,9 @@ class Snapshotter:
     async def build(self) -> dict:
         current_window = self.app.current_window
         current_window_id = current_window.window_id if current_window else None
+        self.progress.panes = sum(len(tab.all_sessions)
+                                  for window in self.app.terminal_windows
+                                  for tab in window.tabs)
         windows = []
         for window in self.app.terminal_windows:
             try:
@@ -592,6 +635,8 @@ class Snapshotter:
         _prune_history()
 
     async def snapshot(self) -> None:
+        self.progress = BuildProgress()
+        began = time.monotonic()
         try:
             snap = await asyncio.wait_for(
                 self.build(), timeout=SNAPSHOT_TIMEOUT_SECONDS)
@@ -607,9 +652,13 @@ class Snapshotter:
                 return
             clean = self._write_latest(snap)
             self._append_history(clean)
+            took = time.monotonic() - began
+            if took > MIN_INTERVAL_SECONDS:
+                log(f"slow snapshot: {took:.0f}s with {self.progress.describe()}")
         except asyncio.TimeoutError:
-            log(f"snapshot abandoned after {SNAPSHOT_TIMEOUT_SECONDS:.0f}s — "
-                "iTerm2 too slow to answer; will retry")
+            log(f"snapshot abandoned after {SNAPSHOT_TIMEOUT_SECONDS:.0f}s with "
+                f"{self.progress.describe()} — iTerm2 too slow to answer; "
+                "will retry once it answers promptly")
         except Exception:
             log("snapshot failed:\n" + traceback.format_exc())
 
@@ -623,15 +672,49 @@ class Snapshotter:
             self.trigger.clear()
             started = time.monotonic()
             await self.snapshot()
-            # Rest at least as long as the build took, so the snapshotter can
-            # never use more than about half of iTerm2's answering capacity.
-            # On a responsive Mac a build is far quicker than
-            # MIN_INTERVAL_SECONDS and this changes nothing; on a loaded one,
-            # where a build can run for minutes, it stops it from rebuilding
-            # back-to-back and becoming a good share of the very slowness it
-            # is struggling against.
             elapsed = time.monotonic() - started
-            await asyncio.sleep(max(MIN_INTERVAL_SECONDS, elapsed))
+            await self._rest(elapsed)
+
+    async def _rest(self, elapsed: float) -> None:
+        """The pause after a build that took ``elapsed`` seconds.
+
+        Rest at least as long as the build took, so the snapshotter can
+        never use more than about half of iTerm2's answering capacity. On a
+        responsive Mac a build is far quicker than MIN_INTERVAL_SECONDS and
+        this changes nothing; on a loaded one, where a build can run for
+        minutes, it stops it from rebuilding back-to-back and becoming a
+        good share of the very slowness it is struggling against.
+
+        The long rest only protects an iTerm2 that is still slow, though,
+        and the load that slowed a build often passes before the rest is
+        over. So it ends as soon as iTerm2 answers its cheapest question
+        promptly; otherwise the live snapshot would stay one more
+        build-length out of date — up to SNAPSHOT_TIMEOUT_SECONDS after an
+        abandoned build — for no one's benefit.
+        """
+        began = time.monotonic()
+        await asyncio.sleep(MIN_INTERVAL_SECONDS)
+        deadline = began + elapsed
+        while (left := deadline - time.monotonic()) > 0:
+            if await self._answers_promptly(min(left, PROMPT_ANSWER_SECONDS)):
+                log(f"iTerm2 answering promptly {time.monotonic() - began:.0f}s "
+                    f"after a {elapsed:.0f}s build; snapshotting again")
+                return
+            left = deadline - time.monotonic()
+            if left > 0:
+                await asyncio.sleep(min(left, REST_PROBE_INTERVAL))
+
+    async def _answers_promptly(self, within: float) -> bool:
+        try:
+            await asyncio.wait_for(_probe_iterm(self.connection),
+                                   timeout=within)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Slow or failing alike: keep resting. A connection that has
+            # died is connection_watchdog's to notice.
+            return False
+        return True
 
     async def _heartbeat(self) -> None:
         while True:
