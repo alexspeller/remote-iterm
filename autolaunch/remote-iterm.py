@@ -15,9 +15,20 @@ Design notes:
   ``./iterm-server`` launch from a shell does.
 - Children are started through the user's LOGIN shell so their real PATH (mise /
   Homebrew node for ``npx vite preview``) is present, which an AutoLaunch env lacks.
-- iTerm2 quit is detected two ways: a SIGTERM/SIGINT handler, and a parent-pid
-  watch (when iTerm2 dies this script reparents to launchd, ppid -> 1).
+- iTerm2 quit is detected two ways: a SIGTERM/SIGINT handler, and a watch on
+  the iTerm2 process itself. iTerm2 sends AutoLaunch scripts no signal when it
+  quits, and runs them as iTerm2 -> login shell -c -> it2_api_wrapper.sh ->
+  python. Neither shell execs its last command, so this script's own parent is
+  the wrapper, which outlives iTerm2 (it is reparented to launchd, but our
+  ppid never changes). Watching only the parent let every iTerm2 restart leave
+  one more supervisor behind: five ran at once on 2026-10-27.
+- Only one supervisor runs at a time, holding an flock on LOCK_PATH. A newer
+  one (iTerm2 relaunched, or the script launched again from the Scripts menu)
+  asks the holder to hand over, and the holder exits without stopping the
+  stack. iTerm2 only runs AutoLaunch at launch, so the newest supervisor is the
+  one whose iTerm2 is current.
 """
+import fcntl
 import os
 import shlex
 import signal
@@ -30,6 +41,12 @@ from pathlib import Path
 REPO = Path(os.path.realpath(__file__)).parent.parent
 ITERM_SERVER = REPO / "iterm-server"
 PIDFILE = REPO / ".iterm-server.pid"
+# Holds the owning supervisor's pid while it holds the flock. A supervisor
+# waiting for the lock writes its own pid to HANDOVER_PATH, so the holder
+# only steps down for one that is still there to take over.
+LOCK_PATH = REPO / ".supervisor.lock"
+HANDOVER_PATH = REPO / ".supervisor.lock.handover"
+LOCK_POLL = 0.5
 LOG_PATH = (Path.home() / "Library" / "Application Support" / "remote-iterm"
             / "snapshots" / "supervisor.log")
 CHECK_INTERVAL = 5.0
@@ -55,6 +72,9 @@ PROBE_TIMEOUT = 2.0
 START_TIMEOUT = 600
 
 _original_ppid = os.getppid()
+_iterm2_pid = 0
+_owner = False
+_handover_requested = False
 _stopping = False
 
 
@@ -120,28 +140,151 @@ def _snapshot_up() -> bool:
     return "snapshot.py" in result.stdout
 
 
+def _ps(pid: int, fields: str) -> str:
+    try:
+        return subprocess.run(
+            ["ps", "-p", str(pid), "-o", fields],
+            capture_output=True, text=True, timeout=5, check=False).stdout.strip()
+    except Exception:
+        return ""
+
+
+def _iterm2_ancestor() -> int:
+    """The pid of the iTerm2 that launched this script, or 0 if none is found
+    (run by hand from a shell, say), in which case the parent is watched."""
+    pid = os.getppid()
+    for _ in range(10):
+        if pid <= 1:
+            return 0
+        ppid, _, command = _ps(pid, "ppid=,comm=").partition(" ")
+        if os.path.basename(command.strip()) == "iTerm2":
+            return pid
+        try:
+            pid = int(ppid)
+        except ValueError:
+            return 0
+    return 0
+
+
+def _iterm2_gone() -> bool:
+    if not _iterm2_pid:
+        return os.getppid() != _original_ppid
+    try:
+        os.kill(_iterm2_pid, 0)
+    except OSError:
+        # PermissionError too: the pid now belongs to another user's process.
+        return True
+    return False
+
+
+def _read_pid(path: Path) -> int:
+    try:
+        return int(path.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def _is_supervisor(pid: int) -> bool:
+    return pid > 0 and Path(__file__).name in _ps(pid, "command=")
+
+
+def _take_lock() -> bool:
+    """Become the only supervisor, asking any current one to hand over.
+    Returns False if iTerm2 quit while waiting, leaving the stack to the
+    holder. The flock goes with this process, so a supervisor that dies by
+    any means, SIGKILL included, frees it at once."""
+    global _owner
+    fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o644)
+    asked = 0
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            pass
+        if _iterm2_gone():
+            if _read_pid(HANDOVER_PATH) == os.getpid():
+                HANDOVER_PATH.unlink(missing_ok=True)
+            log("iTerm2 quit while waiting to take over; exiting")
+            return False
+        # Asked again whenever the holder changes: another newcomer may
+        # have taken the lock first.
+        holder = _read_pid(LOCK_PATH)
+        if holder != asked and _is_supervisor(holder):
+            HANDOVER_PATH.write_text(f"{os.getpid()}\n")
+            log(f"supervisor {holder} is running — asking it to hand over")
+            try:
+                os.kill(holder, signal.SIGUSR1)
+                asked = holder
+            except OSError:
+                pass
+        time.sleep(LOCK_POLL)
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, f"{os.getpid()}\n".encode(), 0)
+    if _read_pid(HANDOVER_PATH) == os.getpid():
+        HANDOVER_PATH.unlink(missing_ok=True)
+    _owner = True
+    return True
+
+
+def _handover_due() -> bool:
+    """Whether a newer supervisor that asked to take over is still waiting.
+    One whose iTerm2 has since quit withdraws, and stepping down for it
+    would leave nobody minding the stack."""
+    global _handover_requested
+    if not _handover_requested:
+        return False
+    _handover_requested = False
+    waiter = _read_pid(HANDOVER_PATH)
+    return waiter != os.getpid() and _is_supervisor(waiter)
+
+
+def _request_handover(*_args) -> None:
+    # Only a flag: exiting from inside a running `start` would kill the
+    # login shell before the launcher releases its lock.
+    global _handover_requested
+    _handover_requested = True
+
+
 def stop_and_exit(*_args) -> None:
     global _stopping
     if _stopping:
         return
     _stopping = True
-    log("stopping stack")
-    _run("stop")
+    # A supervisor still waiting for the lock never ran the stack, and the
+    # holder is the one that stops it.
+    if _owner:
+        log("stopping stack")
+        _run("stop")
     sys.exit(0)
 
 
 def main() -> None:
+    global _iterm2_pid
     signal.signal(signal.SIGTERM, stop_and_exit)
     signal.signal(signal.SIGINT, stop_and_exit)
-    log(f"supervisor starting (repo={REPO}, ppid={_original_ppid})")
+    signal.signal(signal.SIGUSR1, _request_handover)
+    _iterm2_pid = _iterm2_ancestor()
+    log(f"supervisor starting (repo={REPO}, pid={os.getpid()}, "
+        f"ppid={_original_ppid}, iTerm2={_iterm2_pid or 'not found'})")
+    if not _take_lock():
+        return
+    if _iterm2_gone():
+        log("iTerm2 quit before the stack started; stopping")
+        stop_and_exit()
     _run("start")
 
     down_polls = 0
     while True:
         time.sleep(CHECK_INTERVAL)
-        # iTerm2 has quit: our launcher parent died and we reparented to launchd.
-        if os.getppid() != _original_ppid:
-            log("parent changed — iTerm2 quit; stopping")
+        # Checked first: a relaunched iTerm2's supervisor takes over the
+        # running stack without dropping the phones connected to it.
+        if _handover_due():
+            log(f"supervisor {os.getpid()} handing over to "
+                f"{_read_pid(HANDOVER_PATH)}; leaving the stack running")
+            return
+        if _iterm2_gone():
+            log("iTerm2 quit; stopping")
             stop_and_exit()
         # Either the phone server or the independent snapshotter died —
         # `iterm-server start` reconciles each child independently, so
