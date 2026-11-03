@@ -8,3 +8,4 @@ dist/
 *.log
 bun.lock
 .iterm-server.lock*
+.supervisor.lock*
